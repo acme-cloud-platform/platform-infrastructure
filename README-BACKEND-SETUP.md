@@ -125,10 +125,10 @@ Paste the `terraform plan` output back to me before running `terraform apply` �
 
 ## Checklist
 
-- [ ] AWS account created + budget alert set
-- [ ] IAM user created (not using root)
-- [ ] AWS CLI installed
-- [ ] `aws configure` done, `aws sts get-caller-identity` works
-- [ ] Terraform installed
-- [ ] S3 bucket + DynamoDB table created (backend bootstrap)
-- [ ] `terraform init` succeeded in `terraform/vpc`
+- [✅] AWS account created + budget alert set
+- [✅] IAM user created (not using root)
+- [✅] AWS CLI installed
+- [✅] `aws configure` done, `aws sts get-caller-identity` works
+- [✅] Terraform installed
+- [✅] S3 bucket + DynamoDB table created (backend bootstrap)
+- [✅] `terraform init` succeeded in `terraform/vpc`
