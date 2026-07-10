@@ -37,7 +37,7 @@ Each service repo owns: source code, Dockerfile, Helm values, and a workflow fil
 
 Update the checkbox as each phase completes. This is our single source of truth for where the build stands.
 
-- [ ] **Phase 1 — GitHub org + 4 repos created** *(current)*
+- [✅] **Phase 1 — GitHub org + 4 repos created** *(current)*
 - [ ] **Phase 2 — VPC/networking Terraform** (VPC, public/private subnets, IGW, NAT Gateway)
 - [ ] **Phase 3 — EKS cluster + managed node group**
 - [ ] **Phase 4 — ECR repos + RDS (private subnet)**
