@@ -6,6 +6,16 @@ scratch without re-figuring things out.
 
 ---
 
+## One-time setup (do this only once, ever)
+
+See `terraform/vpc/Must-Manual-setup.md` for:
+- Creating the AWS account + IAM user
+- Installing AWS CLI + Terraform
+- `aws configure` setup
+- Creating the S3 bucket + DynamoDB table for Terraform remote state
+
+---
+
 ## Phase 2 — VPC / Networking
 
 ### Deploy
@@ -199,16 +209,41 @@ cd terraform/iam-oidc && terraform destroy
 
 ---
 
-## One-time setup (do this only once, ever)
+## Phase 6 — AWS Load Balancer Controller
 
-See `terraform/vpc/Must-Manual-setup.md` for:
-- Creating the AWS account + IAM user
-- Installing AWS CLI + Terraform
-- `aws configure` setup
-- Creating the S3 bucket + DynamoDB table for Terraform remote state
+### Deploy (depends on vpc + eks)
+```bash
+cd platform-infrastructure/terraform/alb-controller
+terraform init
+terraform plan
+terraform apply
+```
+⏱ Takes 1-3 min — mostly Helm waiting for the controller pod to report Ready.
+
+### Verify
+```bash
+# Both pods should show 1/1 Running
+kubectl get pods -n kube-system | grep aws-load-balancer-controller
+
+# Check for clean startup, no crash loops
+kubectl logs -n kube-system deployment/aws-load-balancer-controller | tail -20
+```
+Real proof it can create ALBs comes later (Phase 8/9) when we deploy a service with an actual `Ingress` resource and watch a real ALB appear in AWS Console.
+
+### Destroy (end of session)
+```bash
+cd terraform/alb-controller && terraform destroy
+```
+
+---
+
+## Troubleshooting we've hit so far
 
 ### "authentication mode must be set to API or API_AND_CONFIG_MAP"
 EKS clusters default to `CONFIG_MAP` auth mode, which doesn't support IAM Access Entries (needed for OIDC/GitHub Actions RBAC in Phase 5). Fix: add `access_config { authentication_mode = "API_AND_CONFIG_MAP" }` to the cluster resource. **Important**: also explicitly set `bootstrap_cluster_creator_admin_permissions = true` in the same block — leaving it unset makes Terraform think it changed and forces a full cluster + node group replacement (30+ min). Setting it explicitly gives a clean in-place update instead.
+
+### `terraform init` fails mid-download with "connection reset by peer"
+Flaky network blip talking to releases.hashicorp.com, not a config issue. Just retry `terraform init` — providers already downloaded are cached, so retry is fast.
 
 ---
 
@@ -221,13 +256,15 @@ cd ../eks && terraform apply           # depends on vpc
 cd ../ecr && terraform apply           # independent
 cd ../rds && terraform apply           # depends on vpc + eks
 cd ../iam-oidc && terraform apply      # depends on eks
+cd ../alb-controller && terraform apply # depends on vpc + eks
 aws eks update-kubeconfig --name acme-cloud-poc-eks --region us-east-1
 kubectl get nodes                      # confirm healthy before continuing
 ```
 
 **Ending work (always do this to avoid ongoing charges):**
 ```bash
-cd terraform/iam-oidc && terraform destroy   # independent, any order
+cd terraform/alb-controller && terraform destroy  # first, so nothing hangs onto the ALB
+cd ../iam-oidc && terraform destroy   # independent, any order
 cd ../rds && terraform destroy                # rds first (depends on eks/vpc)
 cd ../ecr && terraform destroy                # independent, any order
 cd ../eks && terraform destroy                # eks before vpc
