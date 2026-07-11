@@ -2,7 +2,16 @@
 
 Central platform repo for the **Acme Cloud** microservices project — Terraform, CI/CD, and cluster config for all application services.
 
-> Full POC document with detailed architecture: see `POC-platform-engineering-project.md` (also kept in this repo).
+## Documentation — start here
+
+We have 4 docs, each answering a different question. Read in this order the first time:
+
+| Doc | Answers | Read when |
+|---|---|---|
+| **This file (`README.md`)** | What is this project, what's the architecture, what phase are we on | First, and any time you need the big picture |
+| **[`terraform/vpc/README-BACKEND-SETUP.md`](terraform/vpc/README-BACKEND-SETUP.md)** | How do I set up my machine from zero? (AWS account, IAM user, CLI, Terraform install) | Once, before the very first `terraform init` |
+| **[`RUNBOOK.md`](RUNBOOK.md)** | What exact command do I run right now, for deploy/verify/destroy? | Every session — this is your day-to-day cheat sheet |
+| **[`POC-platform-engineering-project.md`](POC-platform-engineering-project.md)** | Why did we design it this way? (ALB vs nginx, no API Gateway, network layout, per-service breakdown) | When you need the reasoning behind a decision — e.g. for an interview |
 
 ---
 
@@ -39,7 +48,7 @@ Update the checkbox as each phase completes. This is our single source of truth 
 
 - [✅] **Phase 1 — GitHub org + 4 repos created** *(current)*
 - [✅] **Phase 2 — VPC/networking Terraform** (VPC, public/private subnets, IGW, NAT Gateway)
-- [ ] **Phase 3 — EKS cluster + managed node group**
+- [✅] **Phase 3 — EKS cluster + managed node group**
 - [ ] **Phase 4 — ECR repos + RDS (private subnet)**
 - [ ] **Phase 5 — IAM OIDC provider for GitHub Actions (no static keys)**
 - [ ] **Phase 6 — AWS Load Balancer Controller (Ingress → real ALB)**
