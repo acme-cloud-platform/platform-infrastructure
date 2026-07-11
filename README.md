@@ -131,8 +131,10 @@ graph TB
 | Cluster security group | `sg-02080e5747d7198f9` |
 | Cluster IAM role | `acme-cloud-poc-eks-cluster-role` (trusts `eks.amazonaws.com`) |
 | Node IAM role | `acme-cloud-poc-eks-node-role` — `arn:aws:iam::338449997393:role/acme-cloud-poc-eks-node-role` (trusts `ec2.amazonaws.com`) |
-| Node group | `acme-cloud-poc-nodes` — 2× `t3.micro`, private subnets only |
+| Node group | `acme-cloud-poc-nodes` — 3× `t3.micro`, private subnets only, `--max-pods=110` per node |
 | Auth mode | `API_AND_CONFIG_MAP` (needed for Phase 5's access entries) |
+| Launch template | `acme-cloud-poc-nodes-*` — custom AL2023 `nodeadm` bootstrap, overrides max-pods |
+| VPC CNI addon | `ENABLE_PREFIX_DELEGATION=true`, `WARM_PREFIX_TARGET=1` |
 
 **How it connects:**
 - Cluster control plane ENIs sit across **all 4 subnets** (public + private) from Phase 2
@@ -157,7 +159,52 @@ graph TB
     Node2 -->|joins via kubelet| CP
 ```
 
+#### Pod density: prefix delegation + max-pods (why we needed both)
+
+Hit a real scheduling wall building Phase 7 (External Secrets Operator): pods stuck `Pending` with `0/2 nodes available: Too many pods`. Root cause and full production reasoning below — this became a genuine platform-engineering problem, not just a config tweak.
+
+**Why `t3.micro` has a pod ceiling at all**
+
+Kubernetes doesn't limit pods-per-node by CPU/memory alone — on AWS, the kubelet also enforces `--max-pods`, a hard ceiling based on how many IP addresses the instance's Elastic Network Interfaces (ENIs) can hand out. Small instance types like `t3.micro` have very few ENI "slots," so by default they can only host a handful of pods (well under 10) — regardless of how much CPU/memory is actually free. This is a **networking limit, not a resource limit**, which is why `kubectl describe nodes` showed low CPU/memory usage even while pods failed to schedule.
+
+**Fix 1 — VPC CNI Prefix Delegation** (`ENABLE_PREFIX_DELEGATION=true`, `WARM_PREFIX_TARGET=1`)
+Instead of the CNI handing out pod IPs one-per-ENI-slot, prefix delegation lets it hand out entire `/28` IP prefixes per ENI slot — dramatically increasing how many IPs (and therefore pods) a single small instance can support, **at no extra EC2 cost**. This is standard practice on **every EKS cluster in production, regardless of node size** — not a POC-only workaround.
+
+**Fix 2 — Explicit `--max-pods=110` via custom launch template**
+Prefix delegation alone wasn't enough: the kubelet's `--max-pods` value is calculated once, at node boot, from a static AWS lookup table keyed on instance type — it doesn't automatically know prefix delegation happened. So even after enabling it, existing (and freshly-booted default) nodes kept their old low ceiling. The real fix required a **custom `aws_launch_template`** using the modern AL2023 `nodeadm` bootstrap format, explicitly setting `kubelet.flags: ["--max-pods=110"]` in the NodeConfig. This forces a node group replacement (~15-20 min) since AMI/bootstrap config changed — expected, not an error.
+
+**Fix 3 — 3 nodes instead of 2**
+Bumped `node_desired_size` 2 → 3 in the same change, so there's real headroom for controller pods (ALB Controller, ESO, CoreDNS, kube-proxy, aws-node) plus future application pods (Phase 8-10), without living right at the edge of the ceiling even with the higher max-pods value.
+
+```mermaid
+graph TB
+    subgraph Before["Before: default max-pods, no prefix delegation"]
+        B1[t3.micro node]
+        B2[ENI: few IP slots]
+        B3["~4 pods max<br/>(hard ceiling)"]
+        B1 --> B2 --> B3
+    end
+    subgraph After["After: prefix delegation + explicit max-pods"]
+        A1[t3.micro node]
+        A2[ENI: /28 prefix per slot<br/>many more IPs available]
+        A3[Launch template:<br/>nodeadm sets --max-pods=110]
+        A4["110 pods max<br/>(same instance type, same cost)"]
+        A1 --> A2
+        A1 --> A3
+        A2 --> A4
+        A3 --> A4
+    end
+```
+
+**Production framing — why this matters beyond just "fixing an error":**
+Prefix delegation is baseline best practice in real EKS clusters regardless of instance size — AWS's own EKS Best Practices Guide recommends it universally, and newer EKS clusters ship with it on by default. What is **not** standard production practice is running `t3.micro` at all — that instance size only exists in this build because of the AWS account's new-account Free Tier restriction (see Phase 3's resource table history / RUNBOOK troubleshooting). A real production cluster would:
+- Size nodes for actual workload CPU/memory requirements (e.g. `m5.large` or bigger), not forced into a tiny instance by an account restriction
+- Still enable prefix delegation regardless of that sizing, purely for IP efficiency
+- Use **Cluster Autoscaler** (Phase 11 on our roadmap) to add/remove nodes automatically based on real scheduling pressure, instead of a fixed `desired_size` — so capacity grows and shrinks with actual traffic rather than being manually tuned
+
 ### Phase 4 — ECR Repos + RDS
+
+
 
 **What exists — ECR:**
 | Repo | URL |
