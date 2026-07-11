@@ -19,6 +19,17 @@ resource "aws_eks_cluster" "main" {
     endpoint_public_access  = true # fine for POC; would restrict via CIDR allowlist in real prod
   }
 
+  # API_AND_CONFIG_MAP enables EKS Access Entries (IAM-role-to-RBAC mapping,
+  # used in Phase 5 for GitHub Actions OIDC deploy access) while keeping the
+  # legacy aws-auth configmap method working too, in case anything still needs it.
+  # bootstrap_cluster_creator_admin_permissions must be explicitly set to true
+  # (matching AWS's original default) — leaving it unset causes Terraform to
+  # see a diff and force a full cluster replacement, which we don't want here.
+  access_config {
+    authentication_mode                         = "API_AND_CONFIG_MAP"
+    bootstrap_cluster_creator_admin_permissions = true
+  }
+
   depends_on = [aws_iam_role_policy_attachment.cluster_policy]
 
   tags = {

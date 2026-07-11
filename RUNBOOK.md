@@ -156,6 +156,49 @@ Harmless for now, still works. Future cleanup: migrate to `use_lockfile` paramet
 
 ---
 
+## Phase 5 — IAM OIDC provider for GitHub Actions
+
+### Deploy (depends on eks — access entries need the cluster to exist)
+```bash
+cd platform-infrastructure/terraform/iam-oidc
+terraform init
+terraform plan
+terraform apply
+```
+
+### Verify
+```bash
+# Confirm the deploy role exists
+aws iam get-role --role-name acme-cloud-poc-github-deploy-role --query 'Role.Arn'
+
+# Confirm it's actually wired into cluster RBAC, not just IAM-side
+aws eks list-access-entries --cluster-name acme-cloud-poc-eks
+```
+
+### The role ARN every service repo's workflow needs
+```
+arn:aws:iam::338449997393:role/acme-cloud-poc-github-deploy-role
+```
+Used like this in each service repo's `.github/workflows/deploy.yml`:
+```yaml
+permissions:
+  id-token: write
+  contents: read
+
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: arn:aws:iam::338449997393:role/acme-cloud-poc-github-deploy-role
+      aws-region: us-east-1
+```
+
+### Destroy (end of session)
+```bash
+cd terraform/iam-oidc && terraform destroy
+```
+
+---
+
 ## One-time setup (do this only once, ever)
 
 See `terraform/vpc/README-BACKEND-SETUP.md` for:
@@ -163,6 +206,9 @@ See `terraform/vpc/README-BACKEND-SETUP.md` for:
 - Installing AWS CLI + Terraform
 - `aws configure` setup
 - Creating the S3 bucket + DynamoDB table for Terraform remote state
+
+### "authentication mode must be set to API or API_AND_CONFIG_MAP"
+EKS clusters default to `CONFIG_MAP` auth mode, which doesn't support IAM Access Entries (needed for OIDC/GitHub Actions RBAC in Phase 5). Fix: add `access_config { authentication_mode = "API_AND_CONFIG_MAP" }` to the cluster resource. **Important**: also explicitly set `bootstrap_cluster_creator_admin_permissions = true` in the same block — leaving it unset makes Terraform think it changed and forces a full cluster + node group replacement (30+ min). Setting it explicitly gives a clean in-place update instead.
 
 ---
 
@@ -174,14 +220,16 @@ cd terraform/vpc && terraform apply   # if not already up
 cd ../eks && terraform apply           # depends on vpc
 cd ../ecr && terraform apply           # independent
 cd ../rds && terraform apply           # depends on vpc + eks
+cd ../iam-oidc && terraform apply      # depends on eks
 aws eks update-kubeconfig --name acme-cloud-poc-eks --region us-east-1
 kubectl get nodes                      # confirm healthy before continuing
 ```
 
 **Ending work (always do this to avoid ongoing charges):**
 ```bash
-cd terraform/rds && terraform destroy   # rds first (depends on eks/vpc)
-cd ../ecr && terraform destroy           # independent, any order
-cd ../eks && terraform destroy           # eks before vpc
-cd ../vpc && terraform destroy           # vpc last
+cd terraform/iam-oidc && terraform destroy   # independent, any order
+cd ../rds && terraform destroy                # rds first (depends on eks/vpc)
+cd ../ecr && terraform destroy                # independent, any order
+cd ../eks && terraform destroy                # eks before vpc
+cd ../vpc && terraform destroy                # vpc last
 ```
