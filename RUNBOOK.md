@@ -92,6 +92,47 @@ terraform destroy
 
 ---
 
+## Phase 4 — ECR repos + RDS
+
+### Deploy ECR (no dependencies — can run any time)
+```bash
+cd platform-infrastructure/terraform/ecr
+terraform init
+terraform plan
+terraform apply
+```
+
+### Deploy RDS (depends on vpc + eks — both must be up first)
+```bash
+cd ../rds
+terraform init
+terraform plan
+terraform apply
+```
+
+### Verify ECR
+```bash
+aws ecr describe-repositories --query 'repositories[].repositoryName'
+```
+
+### Verify RDS
+```bash
+aws rds describe-db-instances \
+  --db-instance-identifier acme-cloud-poc-db \
+  --query 'DBInstances[0].{Status:DBInstanceStatus,PubliclyAccessible:PubliclyAccessible,Endpoint:Endpoint.Address}'
+
+# Confirm the credentials secret exists (does not print the password)
+aws secretsmanager describe-secret --secret-id acme-cloud-poc-rds-credentials
+```
+
+### Destroy (end of session)
+```bash
+cd terraform/rds && terraform destroy   # rds first (depends on eks/vpc)
+cd ../ecr && terraform destroy           # ecr independent, any order is fine
+```
+
+---
+
 ## Troubleshooting we've hit so far
 
 ### "InvalidParameterCombination - not eligible for Free Tier"
@@ -101,7 +142,7 @@ aws ec2 describe-instance-types \
   --filters "Name=free-tier-eligible,Values=true" \
   --query 'InstanceTypes[].InstanceType'
 ```
-Fix: set `node_instance_type` in `terraform/eks/variables.tf` to a Free Tier type (`t3.micro` / `t2.micro`), then `terraform apply` again — Terraform auto-detects the failed (tainted) node group and recreates it.
+Fix: set `node_instance_type` in `terraform/eks/variables.tf` to a Free Tier type (`t3.micro` / `t2.micro`), then `terraform apply` again — Terraform auto-detects the failed (tainted) node group and recreates it. Same fix pattern applies to `db_instance_class` in `terraform/rds/variables.tf` if RDS hits the same restriction.
 
 ### Node group stuck in "CREATING" for a long time
 Normal — first-time node group creation is the slowest step (15-25 min). Check real status instead of guessing:
@@ -131,12 +172,16 @@ See `terraform/vpc/README-BACKEND-SETUP.md` for:
 ```bash
 cd terraform/vpc && terraform apply   # if not already up
 cd ../eks && terraform apply           # depends on vpc
+cd ../ecr && terraform apply           # independent
+cd ../rds && terraform apply           # depends on vpc + eks
 aws eks update-kubeconfig --name acme-cloud-poc-eks --region us-east-1
 kubectl get nodes                      # confirm healthy before continuing
 ```
 
 **Ending work (always do this to avoid ongoing charges):**
 ```bash
-cd terraform/eks && terraform destroy   # eks first
-cd ../vpc && terraform destroy           # vpc second
+cd terraform/rds && terraform destroy   # rds first (depends on eks/vpc)
+cd ../ecr && terraform destroy           # independent, any order
+cd ../eks && terraform destroy           # eks before vpc
+cd ../vpc && terraform destroy           # vpc last
 ```
