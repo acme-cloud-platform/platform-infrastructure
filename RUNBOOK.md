@@ -6,6 +6,18 @@ scratch without re-figuring things out.
 
 ---
 
+## Phase 1 - Must-Manul-Setup.md
+
+## One-time setup (do this only once, ever)
+
+See `Must-Manual-setup.md` for:
+- Creating the AWS account + IAM user
+- Installing AWS CLI + Terraform
+- `aws configure` setup
+- Creating the S3 bucket + DynamoDB table for Terraform remote state
+
+---
+
 ## Phase 2 — VPC / Networking
 
 ### Deploy
@@ -292,6 +304,55 @@ kubectl delete -f k8s/
 
 ---
 
+## Phase 9 — frontend-service (second app repo)
+
+Separate repo again, same pattern as Phase 8. Key difference: shares the **same ALB** as backend-service via IngressGroup, instead of provisioning a second one.
+
+### Deploy
+Push order matters the first time: apply backend's updated Ingress (with matching `group.name`) **before** frontend's, so the shared IngressGroup forms cleanly.
+```bash
+cd backend-service
+git add k8s/ingress.yaml
+git commit -m "Merge into shared ALB IngressGroup with frontend-service"
+git push
+# wait for that workflow to finish and confirm healthy
+
+cd ../frontend-service
+git add .
+git commit -m "..."
+git push
+```
+
+### Verify
+```bash
+kubectl get pods -n default
+kubectl get ingress -n default    # both frontend-service and backend-service should show the SAME ADDRESS
+```
+```bash
+curl http://<shared-alb-address>/            # frontend HTML
+curl http://<shared-alb-address>/api/healthz # backend, same ALB, different path
+```
+Open the ALB address in a browser — real test of the whole platform, submit an order through the actual UI.
+
+### Destroy
+```bash
+kubectl delete -f k8s/
+```
+Only destroy this AFTER backend's, or delete both together — since they share one ALB, deleting one Ingress just drops its rules from the group; the ALB itself only tears down once no Ingress in the group remains.
+
+---
+
+## Dockerfile hardening (frontend-service)
+
+Same distroless approach as backend, but nginx has no official distroless equivalent, so static files are served by a ~40-line zero-dependency Node HTTP server (`server.js`, built-in `http`/`fs` modules only) instead:
+
+- Stage 1 (builder): `node:20-slim`, runs `npm install` + `vite build`
+- Stage 2 (runtime): `gcr.io/distroless/nodejs20-debian12:nonroot`, copies only `dist/` + `server.js`
+
+**Real issue hit**: used `ENTRYPOINT ["server.js"]` in the final stage, which **overrides** the distroless base image's existing `ENTRYPOINT ["/nodejs/bin/node"]` instead of combining with it. Container tried to exec `server.js` directly as a binary → crash loop with `exec: "server.js": executable file not found in $PATH`. Fix: use `CMD ["server.js"]` instead — this combines with the base image's ENTRYPOINT, producing the correct effective command `node server.js`.
+
+---
+
 ## Dockerfile hardening (backend-service)
 
 Started with single-stage `python:3.12-slim` — Docker Desktop's scanner flagged 1 critical + 2 high vulnerabilities. Switched to a **multi-stage build with a distroless final image**:
@@ -353,17 +414,14 @@ Happens when the ServiceAccount used for auth lives in a different namespace tha
 ### `curl <alb>/api/healthz` returns `{"detail":"Not Found"}`
 ALB forwards the full request path (including the `/api` prefix from the Ingress rule) straight to the pod — it does not strip the prefix like some ingress controllers do. If the app's routes are defined without the `/api` prefix (e.g. just `/healthz`), every request 404s. Fix: mount all app routes under an `APIRouter(prefix="/api")` so the app's own paths match what the Ingress forwards. Also update K8s liveness/readiness probe paths and the ALB `healthcheck-path` annotation to match, since those hit the pod directly.
 
----
+### `vite build` fails: "Could not resolve entry module index.html"
+Vite requires `index.html` at the project root (same level as `package.json`), not inside `src/`. Usually means the file either never got committed or was placed in the wrong folder. Check with `git log --oneline --all -- index.html` — if empty, it was never committed.
 
-## One-time setup (do this only once, ever)
-
-See `Must-Manual-setup.md` for:
-- Creating the AWS account + IAM user
-- Installing AWS CLI + Terraform
-- `aws configure` setup
-- Creating the S3 bucket + DynamoDB table for Terraform remote state
+### Distroless container crash loops: `exec: "server.js": executable file not found in $PATH`
+Caused by setting `ENTRYPOINT ["server.js"]` in a Dockerfile whose base image (`gcr.io/distroless/nodejs*`) already has its own `ENTRYPOINT` baked in (pointing at the `node` binary). Setting `ENTRYPOINT` again **overrides** the base image's instead of combining with it, so Docker tries to execute the script directly as a binary. Fix: use `CMD [...]` instead of `ENTRYPOINT [...]` for the script — `CMD` combines with the base image's existing `ENTRYPOINT`, producing the correct `node server.js`.
 
 ---
+
 
 ## Standard order of operations, every session
 

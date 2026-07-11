@@ -53,8 +53,8 @@ Update the checkbox as each phase completes. This is our single source of truth 
 - [✅] **Phase 5 — IAM OIDC provider for GitHub Actions (no static keys)**
 - [✅] **Phase 6 — AWS Load Balancer Controller (Ingress → real ALB)**
 - [✅] **Phase 7 — External Secrets Operator + Secrets Manager wiring**
-- [✅] **Phase 8 — `backend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed** *(current)*
-- [ ] **Phase 9 — `frontend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
+- [✅] **Phase 8 — `backend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
+- [✅] **Phase 9 — `frontend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed** *(current)*
 - [ ] **Phase 10 — `notification-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed (zero infra changes)**
 - [ ] **Phase 11 — Prometheus/Grafana + Cluster Autoscaler, verified under load**
 
@@ -437,7 +437,55 @@ graph TB
     Pod2 --> RDS
 ```
 
+### Phase 9 — frontend-service (second application repo, full stack proven live)
 
+**What exists:**
+| Resource | Value |
+|---|---|
+| Repo | `frontend-service` (React + Vite, separate repo) |
+| Docker image | multi-stage — `node:20-slim` builder → `gcr.io/distroless/nodejs20-debian12:nonroot` runtime |
+| Static server | `server.js` — ~40-line zero-dependency Node HTTP server (no nginx; distroless has no official nginx equivalent) |
+| Deployment | 2 replicas, serves on port 8080 |
+| Ingress | path `/`, **merged into backend's ALB** via `IngressGroup` (`group.name: acme-cloud-poc`) instead of provisioning a second ALB |
+| Live app | same ALB as backend — `k8s-default-backends-...elb.amazonaws.com/` |
+
+**How it connects — the whole platform, proven together for the first time:**
+
+- **One shared ALB, not two**: both `frontend-service` and `backend-service` Ingress resources use the same `group.name`, so AWS Load Balancer Controller (Phase 6) merges them into a single ALB with combined routing rules. `group.order` controls priority — backend's `/api` (order 1) is evaluated before frontend's catch-all `/` (order 10), so `/api` requests don't get swallowed by the frontend's broader rule.
+- **Same-origin API calls, zero CORS config**: because both services sit behind the same ALB/domain, the React app calls `/api/*` as a relative path — no cross-origin request, no CORS headers to manage on the backend.
+- **Same OIDC role, same CI/CD pattern**: `frontend-service`'s workflow reuses the exact same `acme-cloud-poc-github-deploy-role` from Phase 5 — its trust policy already listed this repo from the start.
+- **First genuine end-to-end user-facing proof**: a browser hitting the ALB now renders a real React UI, submits an order through `/api/order`, and the order list re-fetches from `/api/orders` — the full path `browser → ALB → frontend pod` and `browser → ALB → backend pod → RDS` both work simultaneously, confirmed live.
+
+**Real issue hit and fixed**: initial distroless build set `ENTRYPOINT ["server.js"]`, which **overrode** the base image's existing `ENTRYPOINT ["/nodejs/bin/node"]` instead of combining with it — container tried to execute `server.js` directly as a binary and crash-looped with "executable file not found in $PATH". Fixed by using `CMD ["server.js"]` instead, so the final effective command becomes `node server.js`. Full detail in `RUNBOOK.md`.
+
+```mermaid
+graph TB
+    User((Browser))
+    subgraph Pub["Public Subnet"]
+        ALB[Shared ALB<br/>one IngressGroup]
+    end
+    subgraph Priv["Private Subnet"]
+        FPod1[frontend pod 1]
+        FPod2[frontend pod 2]
+        BPod1[backend pod 1]
+        BPod2[backend pod 2]
+        RDS[(RDS Postgres)]
+    end
+
+    User -->|GET /| ALB
+    User -->|GET/POST /api/*| ALB
+    ALB -->|order 10, catch-all| FPod1
+    ALB --> FPod2
+    ALB -->|order 1, /api first| BPod1
+    ALB --> BPod2
+    FPod1 -.same-origin fetch /api.-> ALB
+    BPod1 --> RDS
+    BPod2 --> RDS
+```
+
+
+
+### Full picture so far — everything connected (Phases 1-9)
 
 ```mermaid
 graph TB
@@ -479,6 +527,12 @@ graph TB
         K8sSecret[(K8s Secret<br/>rds-credentials)]
     end
 
+    subgraph App["Phase 8+9 — Full App"]
+        BackendPods[backend-service pods x2]
+        FrontendPods[frontend-service pods x2]
+        RealALB[Shared Live ALB]
+    end
+
     Repos -->|OIDC token| Provider
     Provider --> DeployRole
     DeployRole -->|push images| ECRRepos
@@ -493,11 +547,21 @@ graph TB
     EksOidc --> AlbRole
     AlbRole --> AlbPods
     AlbPods -->|runs on| Nodes
-    AlbPods -->|will create ALB in| Pub
+    AlbPods -->|creates| RealALB
     EksOidc --> EsoRole
     EsoRole --> EsoPod
     EsoPod -->|reads via IRSA| Secret
     EsoPod -->|syncs into| K8sSecret
+    DeployRole -->|deploys| BackendPods
+    DeployRole -->|deploys| FrontendPods
+    ECRRepos -->|image| BackendPods
+    ECRRepos -->|image| FrontendPods
+    K8sSecret -.env vars.-> BackendPods
+    BackendPods -->|SG-restricted 5432| RDS
+    RealALB -->|order 1, /api| BackendPods
+    RealALB -->|order 10, /| FrontendPods
+    RealALB -.-> Pub
+    FrontendPods -.same-origin fetch.-> RealALB
 ```
 
 ### Quick-reference: every ARN / ID we have so far
@@ -516,12 +580,14 @@ EKS OIDC provider (IRSA):                arn:aws:iam::338449997393:oidc-provider
 ALB controller role:                       arn:aws:iam::338449997393:role/acme-cloud-poc-alb-controller-role
 External Secrets role:                       arn:aws:iam::338449997393:role/acme-cloud-poc-external-secrets-role
 K8s Secret (synced):                           rds-credentials (namespace: default)
+Shared live ALB (frontend + backend):            k8s-default-backends-d8c2e36062-1677925831.us-east-1.elb.amazonaws.com
 ECR frontend:      338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-frontend
 ECR backend:        338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-backend
 ECR notification:     338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-notification
 ```
 
-*(Phases 8-11 will be appended here, in this same section, as we build them.)*
+*(Phases 10-11 will be appended here, in this same section, as we build them.)*
+
 
 ---
 

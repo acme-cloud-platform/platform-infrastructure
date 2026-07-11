@@ -109,17 +109,6 @@ resource data, and because local-only state means only your machine "knows"
 what's deployed. With S3 + DynamoDB, state is shared, locked against
 concurrent changes, versioned, and never touches Git.
 
----
-
-## 7. Now run Terraform
-
-```bash
-cd platform-infrastructure/terraform/vpc
-terraform init
-terraform plan
-```
-
-Paste the `terraform plan` output back to me before running `terraform apply` — we sanity check every phase together before it touches real AWS resources.
 
 ---
 
@@ -131,4 +120,3 @@ Paste the `terraform plan` output back to me before running `terraform apply` �
 - [✅] `aws configure` done, `aws sts get-caller-identity` works
 - [✅] Terraform installed
 - [✅] S3 bucket + DynamoDB table created (backend bootstrap)
-- [✅] `terraform init` succeeded in `terraform/vpc`
