@@ -51,8 +51,8 @@ Update the checkbox as each phase completes. This is our single source of truth 
 - [✅] **Phase 3 — EKS cluster + managed node group**
 - [✅] **Phase 4 — ECR repos + RDS (private subnet)**
 - [✅] **Phase 5 — IAM OIDC provider for GitHub Actions (no static keys)**
-- [✅] **Phase 6 — AWS Load Balancer Controller (Ingress → real ALB)** *(current)*
-- [ ] **Phase 7 — External Secrets Operator + Secrets Manager wiring**
+- [✅] **Phase 6 — AWS Load Balancer Controller (Ingress → real ALB)**
+- [✅] **Phase 7 — External Secrets Operator + Secrets Manager wiring** *(current)*
 - [ ] **Phase 8 — `backend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
 - [ ] **Phase 9 — `frontend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
 - [ ] **Phase 10 — `notification-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed (zero infra changes)**
@@ -290,7 +290,55 @@ graph TB
 
 
 
-### Full picture so far — everything connected (Phases 1-6)
+### Phase 7 — External Secrets Operator + Secrets Manager Wiring
+
+**What exists:**
+| Resource | Value |
+|---|---|
+| ESO IAM role | `acme-cloud-poc-external-secrets-role` — `arn:aws:iam::338449997393:role/acme-cloud-poc-external-secrets-role` |
+| ESO namespace | `external-secrets` |
+| ClusterSecretStore | `aws-secretsmanager` — `Ready: True` |
+| ExternalSecret | `rds-credentials` (namespace `default`) — `Status: SecretSynced` |
+| Synced K8s Secret | `rds-credentials` — 5 keys: username, password, dbname, host, port |
+
+**How it connects:**
+- Reuses the **same EKS OIDC provider** from Phase 6 (an AWS account only gets one OIDC provider per issuer URL) — read via remote state instead of recreated
+- ESO's IAM role is scoped tightly: read-only, and only on the **one specific RDS secret ARN** from Phase 4, nothing else in Secrets Manager
+- Used `ClusterSecretStore` instead of namespaced `SecretStore` — the ESO ServiceAccount lives in the `external-secrets` namespace, but the synced Secret needs to land in `default` (where `backend-service` will run); namespaced `SecretStore` only allows same-namespace ServiceAccount references, `ClusterSecretStore` doesn't have that restriction
+- The `ExternalSecret` re-syncs hourly — if the RDS password ever rotates in Secrets Manager, the K8s Secret updates automatically, no redeploy needed
+- `backend-service` (Phase 8) will mount the `rds-credentials` K8s Secret directly as an env var/volume — it never talks to Secrets Manager or AWS APIs itself
+
+**Also fixed in this phase — EKS `max-pods` limit:** hit a real scheduling wall building this (`t3.micro` nodes could only hold ~4 pods each, regardless of VPC CNI prefix delegation, because kubelet's `--max-pods` is set once at node boot from a static AWS table). Fixed with a custom launch template using AL2023 `nodeadm` config to explicitly set `--max-pods=110`, plus bumping to 3 nodes. Full detail in `RUNBOOK.md`.
+
+```mermaid
+graph TB
+    subgraph Secrets["Phase 4 — Data"]
+        SM[Secrets Manager<br/>RDS credentials]
+    end
+    subgraph IRSA["Phase 6 — Shared OIDC"]
+        EksOidc[EKS OIDC Provider]
+    end
+    subgraph ESO["Phase 7 — External Secrets"]
+        EsoRole[eso IAM role]
+        EsoPod[ESO pod]
+        CSS[ClusterSecretStore]
+        ExtSecret[ExternalSecret<br/>rds-credentials]
+    end
+    K8sSecret[(K8s Secret<br/>rds-credentials)]
+    Backend[backend-service<br/>Phase 8, not built yet]
+
+    EksOidc --> EsoRole
+    EsoRole --> EsoPod
+    EsoPod -->|reads, via IRSA creds| SM
+    EsoPod --> CSS
+    CSS --> ExtSecret
+    ExtSecret -->|materializes| K8sSecret
+    Backend -.will mount.-> K8sSecret
+```
+
+
+
+### Full picture so far — everything connected (Phases 1-7)
 
 ```mermaid
 graph TB
@@ -326,6 +374,12 @@ graph TB
         AlbPods[Controller pods x2]
     end
 
+    subgraph ESO["Phase 7 — Secrets Sync"]
+        EsoRole[eso-role]
+        EsoPod[ESO pod]
+        K8sSecret[(K8s Secret<br/>rds-credentials)]
+    end
+
     Repos -->|OIDC token| Provider
     Provider --> DeployRole
     DeployRole -->|push images| ECRRepos
@@ -341,6 +395,10 @@ graph TB
     AlbRole --> AlbPods
     AlbPods -->|runs on| Nodes
     AlbPods -->|will create ALB in| Pub
+    EksOidc --> EsoRole
+    EsoRole --> EsoPod
+    EsoPod -->|reads via IRSA| Secret
+    EsoPod -->|syncs into| K8sSecret
 ```
 
 ### Quick-reference: every ARN / ID we have so far
@@ -357,12 +415,14 @@ GitHub OIDC provider:                arn:aws:iam::338449997393:oidc-provider/tok
 GitHub deploy role:                    arn:aws:iam::338449997393:role/acme-cloud-poc-github-deploy-role
 EKS OIDC provider (IRSA):                arn:aws:iam::338449997393:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/1CE30413C41DA517ADB1C61C126172E5
 ALB controller role:                       arn:aws:iam::338449997393:role/acme-cloud-poc-alb-controller-role
+External Secrets role:                       arn:aws:iam::338449997393:role/acme-cloud-poc-external-secrets-role
+K8s Secret (synced):                           rds-credentials (namespace: default)
 ECR frontend:      338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-frontend
 ECR backend:        338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-backend
 ECR notification:     338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-notification
 ```
 
-*(Phases 7-11 will be appended here, in this same section, as we build them.)*
+*(Phases 8-11 will be appended here, in this same section, as we build them.)*
 
 ---
 

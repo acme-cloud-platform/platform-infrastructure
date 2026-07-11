@@ -5,6 +5,7 @@ phase, so we (or anyone else) can rebuild or verify the whole thing from
 scratch without re-figuring things out.
 
 ---
+## Phase 1 — Must Manual Setup
 
 ## One-time setup (do this only once, ever)
 
@@ -237,6 +238,60 @@ cd terraform/alb-controller && terraform destroy
 
 ---
 
+## Phase 7 — External Secrets Operator + Secrets Manager wiring
+
+### Deploy (depends on eks + rds + alb-controller — reuses its EKS OIDC provider)
+```bash
+cd platform-infrastructure/terraform/external-secrets
+terraform init
+terraform plan
+```
+**Must apply in 2 steps** — `kubernetes_manifest` resources (SecretStore/ExternalSecret CRDs) fail plan-time validation if the CRDs don't exist in the cluster yet:
+```bash
+terraform apply -target=helm_release.eso -target=aws_iam_role_policy.eso_secrets_read -target=kubernetes_service_account.eso
+terraform apply
+```
+
+### Verify
+```bash
+kubectl get clustersecretstore
+kubectl get externalsecret -n default
+kubectl get secret rds-credentials -n default
+```
+`clustersecretstore` should show `READY: True`. `externalsecret` should show `STATUS: SecretSynced`, `READY: True`. The `secret` should exist with 5 data keys (username, password, dbname, host, port) — this is the real proof credentials flowed from Secrets Manager into a usable K8s Secret.
+
+### Destroy (end of session)
+```bash
+cd terraform/external-secrets && terraform destroy
+```
+
+---
+
+## EKS node group: max-pods fix (added mid-Phase 7)
+
+Ran into this rebuilding ESO — worth its own section since it touches the `eks/` module directly, not just external-secrets.
+
+**Symptom**: pods stuck `Pending` forever, `kubectl get events` shows `0/2 nodes are available: 2 Too many pods`.
+
+**Root cause**: `t3.micro` nodes (forced by the Free Tier restriction) have a very low kubelet `--max-pods` ceiling, set once at node boot from a static AWS lookup table based on instance type. Enabling VPC CNI prefix delegation (`ENABLE_PREFIX_DELEGATION=true`) raises available IPs but does **not** by itself raise `--max-pods` — that's a separate setting, and it doesn't retroactively apply to already-running nodes either way.
+
+**Real fix**: a custom `aws_launch_template` with AL2023 `nodeadm` user-data that explicitly overrides `--max-pods=110`, referenced by the node group's `launch_template` block. This forces a node group replacement (~15-20 min) since AMI/bootstrap config changed. Combined this with bumping `node_desired_size` 2 → 3 in the same apply.
+
+```bash
+# after eks/main.tf + variables.tf updated with launch template + max-pods
+cd terraform/eks
+terraform plan   # expect: aws_launch_template create, aws_eks_node_group replace
+terraform apply  # ~15-20 min, node group fully replaces
+
+# verify it worked
+kubectl get nodes                       # should show 3 nodes Ready
+kubectl describe node <name> | grep -A3 "Allocatable"   # pods: should now read 110
+```
+
+**Production note**: prefix delegation is standard practice on every node size in real production, not just a POC fix. What's not standard is running `t3.micro` at all — that's purely a Free Tier account restriction. A real cluster sizes nodes for actual workload requirements and lets Cluster Autoscaler (Phase 11) handle horizontal scaling; prefix delegation just quietly improves IP efficiency underneath, regardless of instance size.
+
+---
+
 ## Troubleshooting we've hit so far
 
 ### "authentication mode must be set to API or API_AND_CONFIG_MAP"
@@ -244,6 +299,16 @@ EKS clusters default to `CONFIG_MAP` auth mode, which doesn't support IAM Access
 
 ### `terraform init` fails mid-download with "connection reset by peer"
 Flaky network blip talking to releases.hashicorp.com, not a config issue. Just retry `terraform init` — providers already downloaded are cached, so retry is fast.
+
+### `kubernetes_manifest` resource fails: "no matches for kind X in group Y (CRD may not be installed)"
+Terraform validates `kubernetes_manifest` resources against the cluster's live API schema at plan time — but the CRD (from a Helm chart in the same apply) doesn't exist yet on a first-ever apply. Fix: apply the Helm release first with `-target`, then apply everything else in a second pass. Not a bug, this is standard/expected Terraform + CRD behavior.
+
+### `0/2 nodes are available: 2 Too many pods`
+See "EKS node group: max-pods fix" section above — instance-type pod-count ceiling, not a resource (CPU/memory) shortage. Confirm with `kubectl describe nodes | grep -A5 "Allocated resources"` (memory/CPU usage will look low) vs `kubectl get events -n <namespace>` (will explicitly say "Too many pods").
+
+### `SecretStore` admission webhook: "namespace should either be empty or match the namespace of the SecretStore"
+Happens when the ServiceAccount used for auth lives in a different namespace than the `SecretStore` resource itself — namespaced `SecretStore` only allows same-namespace ServiceAccount references. Fix: use `ClusterSecretStore` instead (cluster-scoped, no `namespace` in its own metadata), which is explicitly designed to reference a ServiceAccount from any namespace.
+
 
 ---
 
@@ -257,13 +322,16 @@ cd ../ecr && terraform apply           # independent
 cd ../rds && terraform apply           # depends on vpc + eks
 cd ../iam-oidc && terraform apply      # depends on eks
 cd ../alb-controller && terraform apply # depends on vpc + eks
+cd ../external-secrets && terraform apply -target=helm_release.eso -target=aws_iam_role_policy.eso_secrets_read -target=kubernetes_service_account.eso
+cd ../external-secrets && terraform apply   # 2nd pass, picks up CRD manifests
 aws eks update-kubeconfig --name acme-cloud-poc-eks --region us-east-1
 kubectl get nodes                      # confirm healthy before continuing
 ```
 
 **Ending work (always do this to avoid ongoing charges):**
 ```bash
-cd terraform/alb-controller && terraform destroy  # first, so nothing hangs onto the ALB
+cd terraform/external-secrets && terraform destroy  # first
+cd ../alb-controller && terraform destroy  # so nothing hangs onto the ALB
 cd ../iam-oidc && terraform destroy   # independent, any order
 cd ../rds && terraform destroy                # rds first (depends on eks/vpc)
 cd ../ecr && terraform destroy                # independent, any order

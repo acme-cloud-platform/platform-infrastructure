@@ -1,4 +1,4 @@
- variable "aws_region" {
+variable "aws_region" {
   type    = string
   default = "us-east-1"
 }
@@ -27,7 +27,7 @@ variable "node_instance_type" {
 
 variable "node_desired_size" {
   type    = number
-  default = 2
+  default = 3
 }
 
 variable "node_min_size" {
