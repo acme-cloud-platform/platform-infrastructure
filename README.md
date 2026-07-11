@@ -49,7 +49,7 @@ Update the checkbox as each phase completes. This is our single source of truth 
 - [✅] **Phase 1 — GitHub org + 4 repos created** *(current)*
 - [✅] **Phase 2 — VPC/networking Terraform** (VPC, public/private subnets, IGW, NAT Gateway)
 - [✅] **Phase 3 — EKS cluster + managed node group**
-- [ ] **Phase 4 — ECR repos + RDS (private subnet)**
+- [✅] **Phase 4 — ECR repos + RDS (private subnet)**
 - [ ] **Phase 5 — IAM OIDC provider for GitHub Actions (no static keys)**
 - [ ] **Phase 6 — AWS Load Balancer Controller (Ingress → real ALB)**
 - [ ] **Phase 7 — External Secrets Operator + Secrets Manager wiring**
