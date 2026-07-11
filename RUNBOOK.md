@@ -201,7 +201,7 @@ cd terraform/iam-oidc && terraform destroy
 
 ## One-time setup (do this only once, ever)
 
-See `terraform/vpc/README-BACKEND-SETUP.md` for:
+See `terraform/vpc/Must-Manual-setup.md` for:
 - Creating the AWS account + IAM user
 - Installing AWS CLI + Terraform
 - `aws configure` setup
