@@ -52,8 +52,8 @@ Update the checkbox as each phase completes. This is our single source of truth 
 - [✅] **Phase 4 — ECR repos + RDS (private subnet)**
 - [✅] **Phase 5 — IAM OIDC provider for GitHub Actions (no static keys)**
 - [✅] **Phase 6 — AWS Load Balancer Controller (Ingress → real ALB)**
-- [✅] **Phase 7 — External Secrets Operator + Secrets Manager wiring** *(current)*
-- [ ] **Phase 8 — `backend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
+- [✅] **Phase 7 — External Secrets Operator + Secrets Manager wiring**
+- [✅] **Phase 8 — `backend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed** *(current)*
 - [ ] **Phase 9 — `frontend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
 - [ ] **Phase 10 — `notification-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed (zero infra changes)**
 - [ ] **Phase 11 — Prometheus/Grafana + Cluster Autoscaler, verified under load**
@@ -383,9 +383,61 @@ graph TB
     Backend -.will mount.-> K8sSecret
 ```
 
+### Phase 8 — backend-service (first application repo, deployed)
+
+**What exists:**
+| Resource | Value |
+|---|---|
+| Repo | `backend-service` (FastAPI, separate repo from `platform-infrastructure`) |
+| Docker image | multi-stage build — `python:3.11-slim` builder → `gcr.io/distroless/python3-debian12:nonroot` runtime |
+| Deployment | 2 replicas, resource requests/limits sized for `t3.micro` nodes |
+| Service | ClusterIP, internal only |
+| Ingress | triggers Phase 6's ALB Controller — real ALB provisioned automatically |
+| Live ALB | `k8s-default-backends-d8c2e36062-1677925831.us-east-1.elb.amazonaws.com` |
+| Endpoints | `GET /api/healthz`, `GET /api/readyz` (real RDS check), `POST /api/order`, `GET /api/orders` |
+
+**How it connects — first real end-to-end proof of every prior phase:**
+
+- **CI/CD auth (Phase 5)**: workflow assumes `acme-cloud-poc-github-deploy-role` via OIDC — zero static AWS keys in this repo either
+- **Image registry (Phase 4)**: built image pushed to `acme-cloud-poc-backend` ECR repo, tagged with the commit SHA
+- **Cluster deploy (Phase 3 + 5)**: `kubectl apply` succeeds because of the EKS Access Entry mapping the same OIDC role to `AmazonEKSEditPolicy`
+- **DB credentials (Phase 7)**: the Deployment's env vars pull from the `rds-credentials` K8s Secret via `secretKeyRef` — the app never touches Secrets Manager or AWS credentials directly
+- **Ingress → ALB (Phase 6)**: creating the `Ingress` resource is what triggers AWS Load Balancer Controller to actually provision a real, internet-facing ALB — this was the first real-world test of that controller since it went live in Phase 6
+- **Network path**: `Internet → ALB (public subnet) → target group → pod (private subnet) → RDS (private subnet, SG-restricted to EKS nodes)`
+
+**Two real issues hit and fixed in this phase** (full detail in `RUNBOOK.md`):
+1. **Routing mismatch** — ALB forwards the full path including `/api`, but the app's routes weren't prefixed with `/api`, causing 404s. Fixed by mounting all routes under `APIRouter(prefix="/api")`.
+2. **Container vulnerabilities** — initial single-stage `python:3.12-slim` image flagged 1 critical + 2 high CVEs by Docker's scanner. Rebuilt as a multi-stage distroless image — no shell, no package manager, drastically smaller attack surface. Debugging without a shell relies on structured logs and `kubectl debug --image=busybox` (attaches a temporary sidecar debug container without modifying the production image).
+
+```mermaid
+graph TB
+    User((User / curl))
+    subgraph Pub["Public Subnet"]
+        ALB[Real ALB<br/>auto-provisioned by Phase 6 controller]
+    end
+    subgraph Priv["Private Subnet"]
+        Pod1[backend-service pod 1]
+        Pod2[backend-service pod 2]
+        RDS[(RDS Postgres)]
+    end
+    Secret[(K8s Secret<br/>rds-credentials<br/>from Phase 7)]
+    ECR[ECR: acme-cloud-poc-backend<br/>Phase 4]
+    GH[GitHub Actions<br/>OIDC via Phase 5 role]
+
+    GH -->|push image| ECR
+    GH -->|kubectl apply| Pod1
+    ECR -->|node pulls image| Pod1
+    ECR --> Pod2
+    User -->|GET/POST /api/*| ALB
+    ALB --> Pod1
+    ALB --> Pod2
+    Secret -.env vars.-> Pod1
+    Secret -.env vars.-> Pod2
+    Pod1 -->|SG-restricted 5432| RDS
+    Pod2 --> RDS
+```
 
 
-### Full picture so far — everything connected (Phases 1-7)
 
 ```mermaid
 graph TB

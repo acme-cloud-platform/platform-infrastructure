@@ -5,17 +5,6 @@ phase, so we (or anyone else) can rebuild or verify the whole thing from
 scratch without re-figuring things out.
 
 ---
-## Phase 1 — Must Manual Setup
-
-## One-time setup (do this only once, ever)
-
-See `Must-Manual-setup.md` for:
-- Creating the AWS account + IAM user
-- Installing AWS CLI + Terraform
-- `aws configure` setup
-- Creating the S3 bucket + DynamoDB table for Terraform remote state
-
----
 
 ## Phase 2 — VPC / Networking
 
@@ -267,6 +256,58 @@ cd terraform/external-secrets && terraform destroy
 
 ---
 
+## Phase 8 — backend-service (app repo, not platform-infrastructure)
+
+This is a separate repo. No Terraform here — the app repo only owns code, Dockerfile, K8s manifests, and its own workflow.
+
+### Deploy
+Push to `main` — the workflow runs automatically, no manual command needed:
+```bash
+cd backend-service
+git add .
+git commit -m "..."
+git push
+```
+Workflow does: OIDC auth (Phase 5 role) → build/push image to ECR (Phase 4) → `kubectl apply` the 3 manifests → wait for rollout.
+
+### Verify
+```bash
+kubectl get pods -n default
+kubectl get deployment backend-service -n default
+kubectl get ingress backend-service -n default    # ADDRESS column = real ALB DNS name, proof Phase 6 works end-to-end
+```
+
+Test the live endpoint (get the ALB address from the ingress command above):
+```bash
+curl http://<alb-address>/api/healthz
+curl http://<alb-address>/api/readyz     # confirms RDS connectivity, not just pod liveness
+curl -X POST http://<alb-address>/api/order -H "Content-Type: application/json" -d '{"item":"widget","quantity":2}'
+```
+
+### Destroy
+No separate Terraform destroy — deleting the Deployment/Service/Ingress removes the ALB too:
+```bash
+kubectl delete -f k8s/
+```
+
+---
+
+## Dockerfile hardening (backend-service)
+
+Started with single-stage `python:3.12-slim` — Docker Desktop's scanner flagged 1 critical + 2 high vulnerabilities. Switched to a **multi-stage build with a distroless final image**:
+
+- Stage 1 (builder): `python:3.11-slim`, installs deps into `/app/deps`
+- Stage 2 (runtime): `gcr.io/distroless/python3-debian12:nonroot` — no shell, no package manager, drastically smaller attack surface
+
+**Key gotcha**: the builder's Python minor version must exactly match distroless's bundled Python (3.11) — `psycopg2` and other compiled C extensions are ABI-tied to a specific Python minor version, so a mismatch causes import failures at container startup, not at build time.
+
+**Debugging without a shell** (since distroless has none):
+- Rely on structured logs shipped out of the container, not `docker exec`
+- `kubectl debug -it <pod> --image=busybox --target=<container>` attaches a temporary debug container to the same pod namespace without modifying the production image
+- Readiness/liveness probes (`/api/healthz`, `/api/readyz`) catch most failures before manual debugging is even needed
+
+---
+
 ## EKS node group: max-pods fix (added mid-Phase 7)
 
 Ran into this rebuilding ESO — worth its own section since it touches the `eks/` module directly, not just external-secrets.
@@ -309,6 +350,18 @@ See "EKS node group: max-pods fix" section above — instance-type pod-count cei
 ### `SecretStore` admission webhook: "namespace should either be empty or match the namespace of the SecretStore"
 Happens when the ServiceAccount used for auth lives in a different namespace than the `SecretStore` resource itself — namespaced `SecretStore` only allows same-namespace ServiceAccount references. Fix: use `ClusterSecretStore` instead (cluster-scoped, no `namespace` in its own metadata), which is explicitly designed to reference a ServiceAccount from any namespace.
 
+### `curl <alb>/api/healthz` returns `{"detail":"Not Found"}`
+ALB forwards the full request path (including the `/api` prefix from the Ingress rule) straight to the pod — it does not strip the prefix like some ingress controllers do. If the app's routes are defined without the `/api` prefix (e.g. just `/healthz`), every request 404s. Fix: mount all app routes under an `APIRouter(prefix="/api")` so the app's own paths match what the Ingress forwards. Also update K8s liveness/readiness probe paths and the ALB `healthcheck-path` annotation to match, since those hit the pod directly.
+
+---
+
+## One-time setup (do this only once, ever)
+
+See `Must-Manual-setup.md` for:
+- Creating the AWS account + IAM user
+- Installing AWS CLI + Terraform
+- `aws configure` setup
+- Creating the S3 bucket + DynamoDB table for Terraform remote state
 
 ---
 
