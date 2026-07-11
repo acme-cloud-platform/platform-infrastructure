@@ -50,8 +50,8 @@ Update the checkbox as each phase completes. This is our single source of truth 
 - [✅] **Phase 2 — VPC/networking Terraform** (VPC, public/private subnets, IGW, NAT Gateway)
 - [✅] **Phase 3 — EKS cluster + managed node group**
 - [✅] **Phase 4 — ECR repos + RDS (private subnet)**
-- [✅] **Phase 5 — IAM OIDC provider for GitHub Actions (no static keys)** *(current)*
-- [ ] **Phase 6 — AWS Load Balancer Controller (Ingress → real ALB)**
+- [✅] **Phase 5 — IAM OIDC provider for GitHub Actions (no static keys)**
+- [✅] **Phase 6 — AWS Load Balancer Controller (Ingress → real ALB)** *(current)*
 - [ ] **Phase 7 — External Secrets Operator + Secrets Manager wiring**
 - [ ] **Phase 8 — `backend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
 - [ ] **Phase 9 — `frontend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
@@ -243,7 +243,54 @@ sequenceDiagram
     GH->>EKS: kubectl apply (via EKS Access Entry → EditPolicy)
 ```
 
-### Full picture so far — everything connected (Phases 1-5)
+### Phase 6 — AWS Load Balancer Controller
+
+**What exists:**
+| Resource | Value |
+|---|---|
+| EKS OIDC provider (IRSA) | `arn:aws:iam::338449997393:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/1CE30413C41DA517ADB1C61C126172E5` |
+| Controller IAM role | `acme-cloud-poc-alb-controller-role` — `arn:aws:iam::338449997393:role/acme-cloud-poc-alb-controller-role` |
+| Controller IAM policy | official AWS-published policy — full ELB/EC2 permissions to create/manage ALBs, target groups, listeners, security groups |
+| Kubernetes ServiceAccount | `aws-load-balancer-controller` in `kube-system`, annotated with the IAM role ARN |
+| Helm release | `aws-load-balancer-controller` chart v1.8.1, 2 replicas, both `Running` |
+
+**How it connects — a different kind of OIDC than Phase 5:**
+
+Phase 5's OIDC lets something **outside** AWS (GitHub Actions) assume a role. Phase 6 uses a different mechanism called **IRSA** (IAM Roles for Service Accounts) — it lets a **pod running inside EKS** assume a role, using the cluster's own built-in OIDC issuer (`oidc.eks.us-east-1.amazonaws.com/id/...`), which is separate from GitHub's OIDC issuer.
+
+The trust is entirely carried by one annotation on the Kubernetes ServiceAccount:
+```
+eks.amazonaws.com/role-arn: arn:aws:iam::338449997393:role/acme-cloud-poc-alb-controller-role
+```
+When the controller pod starts using that ServiceAccount, EKS automatically injects temporary AWS credentials scoped to that role — no secret, no key, ever stored in the cluster.
+
+Once running, the controller watches the Kubernetes API for `Ingress` resources. When `backend-service`/`frontend-service` (Phase 8/9) create one, the controller reads the subnet tags from Phase 2 (`kubernetes.io/role/elb` for public, `kubernetes.io/role/internal-elb` for private) to decide where to place the ALB, then calls the AWS ELB API directly using its IRSA credentials to actually create it.
+
+```mermaid
+graph TB
+    subgraph EKS["EKS Cluster"]
+        SA[ServiceAccount<br/>aws-load-balancer-controller]
+        Pod1[Controller pod 1]
+        Pod2[Controller pod 2]
+        Ing[Ingress resource<br/>created later in Phase 8/9]
+    end
+    OIDC[EKS OIDC Provider<br/>cluster's own issuer]
+    Role[alb-controller-role]
+    Policy[Official AWS ELB/EC2 policy]
+
+    SA -.annotated with role ARN.-> Role
+    OIDC --> Role
+    Role --> Policy
+    Pod1 -->|uses| SA
+    Pod2 -->|uses| SA
+    Ing -->|watched by| Pod1
+    Pod1 -->|creates via IRSA creds| ALB[Real ALB in AWS]
+    ALB -->|placed using subnet tags| Pub[Public subnets, Phase 2]
+```
+
+
+
+### Full picture so far — everything connected (Phases 1-6)
 
 ```mermaid
 graph TB
@@ -251,8 +298,8 @@ graph TB
         Repos[4 repos in acme-cloud-platform org]
     end
 
-    subgraph OIDC["Phase 5 — Trust"]
-        Provider[OIDC Provider]
+    subgraph OIDC5["Phase 5 — GitHub Trust"]
+        Provider[GitHub OIDC Provider]
         DeployRole[github-deploy-role]
     end
 
@@ -273,6 +320,12 @@ graph TB
         Secret[Secrets Manager]
     end
 
+    subgraph OIDC6["Phase 6 — Cluster Trust (IRSA)"]
+        EksOidc[EKS OIDC Provider]
+        AlbRole[alb-controller-role]
+        AlbPods[Controller pods x2]
+    end
+
     Repos -->|OIDC token| Provider
     Provider --> DeployRole
     DeployRole -->|push images| ECRRepos
@@ -284,6 +337,10 @@ graph TB
     Nodes -.-> Priv
     Cluster -.control plane ENIs.-> Pub
     Cluster -.-> Priv
+    EksOidc --> AlbRole
+    AlbRole --> AlbPods
+    AlbPods -->|runs on| Nodes
+    AlbPods -->|will create ALB in| Pub
 ```
 
 ### Quick-reference: every ARN / ID we have so far
@@ -296,14 +353,16 @@ EKS node role:                arn:aws:iam::338449997393:role/acme-cloud-poc-eks-
 RDS endpoint:                  acme-cloud-poc-db.c8vqsikioi3n.us-east-1.rds.amazonaws.com
 RDS security group:              sg-0cc373dbdf0493486
 RDS secret:                        arn:aws:secretsmanager:us-east-1:338449997393:secret:acme-cloud-poc-rds-credentials-GLxxD4
-OIDC provider:                       arn:aws:iam::338449997393:oidc-provider/token.actions.githubusercontent.com
+GitHub OIDC provider:                arn:aws:iam::338449997393:oidc-provider/token.actions.githubusercontent.com
 GitHub deploy role:                    arn:aws:iam::338449997393:role/acme-cloud-poc-github-deploy-role
+EKS OIDC provider (IRSA):                arn:aws:iam::338449997393:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/1CE30413C41DA517ADB1C61C126172E5
+ALB controller role:                       arn:aws:iam::338449997393:role/acme-cloud-poc-alb-controller-role
 ECR frontend:      338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-frontend
 ECR backend:        338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-backend
 ECR notification:     338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-notification
 ```
 
-*(Phases 6-11 will be appended here, in this same section, as we build them.)*
+*(Phases 7-11 will be appended here, in this same section, as we build them.)*
 
 ---
 
@@ -328,7 +387,7 @@ platform-infrastructure/
 │   └── reusable-deploy.yml
 ├── POC.md
 ├── RUNBOOK.md
-├── README-BACKEND-SETUP.md
+├── Must-Manual-setup.md
 └── README.md
 ```
 
