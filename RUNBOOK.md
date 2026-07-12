@@ -278,9 +278,13 @@ cd live/poc/alb-controller && terragrunt destroy
 cd platform-infrastructure/live/poc/external-secrets
 terragrunt init
 terragrunt plan
+```
+**Still must apply in 2 steps on a first-ever apply** — Terragrunt's `dependency` blocks (on `eks`, `rds`, `alb-controller`) only solve *cross-module* ordering, resolving those modules' outputs before this one runs. They don't touch the *separate* problem inside this module: `helm_release.eso` (which installs the ExternalSecrets CRDs) and the `kubernetes_manifest` resources (`ClusterSecretStore`, `ExternalSecret`) live in the same `modules/external-secrets/main.tf`, same apply — and Terraform validates `kubernetes_manifest` against the cluster's live API schema at plan time, before the CRDs exist yet on a first-ever run. Same fix as before, just with `terragrunt` instead of `terraform`:
+```bash
+terragrunt apply -target=helm_release.eso -target=aws_iam_role_policy.eso_secrets_read -target=kubernetes_service_account.eso
 terragrunt apply
 ```
-No more manual 2-step `-target` dance — Terragrunt's `dependency` blocks (on `eks`, `rds`, and `alb-controller`) resolve real outputs on `apply` and supply `mock_outputs` during `plan`, so the old CRD-not-installed-yet plan-time failure doesn't happen anymore as long as `eks`, `rds`, and `alb-controller` were applied first, in that order.
+On any *later* apply (CRDs already installed from the first run), a single `terragrunt apply` is fine — this 2-step dance is only required the very first time this module is applied in a given environment.
 
 ### Verify
 ```bash
@@ -527,13 +531,14 @@ cd ../ecr && terragrunt apply             # independent
 cd ../rds && terragrunt apply             # depends on vpc + eks
 cd ../iam-oidc && terragrunt apply        # depends on eks
 cd ../alb-controller && terragrunt apply  # depends on vpc + eks
-cd ../external-secrets && terragrunt apply # depends on eks + rds + alb-controller
+cd ../external-secrets && terragrunt apply -target=helm_release.eso -target=aws_iam_role_policy.eso_secrets_read -target=kubernetes_service_account.eso
+cd ../external-secrets && terragrunt apply   # 2nd pass, picks up CRD-dependent manifests — only needed on this environment's first-ever apply
 
 aws eks update-kubeconfig --name acme-cloud-poc-eks --region us-east-1
 kubectl get nodes                      # confirm healthy before continuing
 kubectl get pods -n default            # confirm backend-service, frontend-service, notification-service all Running
 ```
-No more 2-pass `-target` step for `external-secrets` — Terragrunt's `dependency` blocks handle the CRD-ordering problem that used to require it.
+The `external-secrets` 2-step apply is still required the first time this module runs in a given environment — Terragrunt's `dependency` blocks only fixed *cross-module* ordering (this module correctly waiting on `eks`/`rds`/`alb-controller`'s outputs); the CRD-before-manifest problem is *inside* this one module and Terragrunt doesn't change that. See Phase 7 above for the full explanation. On repeat applies (CRDs already installed), a single `terragrunt apply` is enough.
 
 **Ending work (always do this to avoid ongoing charges):**
 ```bash
