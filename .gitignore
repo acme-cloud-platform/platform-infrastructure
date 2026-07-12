@@ -1,3 +1,7 @@
+# Terragrunt
+**/.terragrunt-cache/*
+.terragrunt-cache/
+
 # Terraform
 **/.terraform/*
 *.tfstate
@@ -12,6 +16,13 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+
+# Terragrunt-generated files — auto-created by the root `generate` blocks in
+# live/terragrunt.hcl on every `terragrunt init`/`plan`/`apply`. Never commit
+# these — they're regenerated fresh every run, and committing a stale copy
+# can mask real config drift.
+backend.tf
+provider.tf
 
 # AWS / credentials
 .aws/
