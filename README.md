@@ -9,7 +9,7 @@ We have 3 docs now, each answering a different question. Read in this order the 
 | Doc | Answers | Read when |
 |---|---|---|
 | **This file (`README.md`)** | What is this project, what's the architecture, what phase are we on, how does everything connect | First, and any time you need the big picture |
-| **[`Must-Manual-setup.md`](Must-Manual-setup.md)** | How do I set up my machine from zero? (AWS account, IAM user, CLI, Terraform install) | Once, before the very first `terraform init` |
+| **[`Must-Manual-setup.md`](Must-Manual-setup.md)** | How do I set up my machine from zero? (AWS account, IAM user, CLI, Terraform + Terragrunt install) | Once, before the very first `terragrunt init` |
 | **[`RUNBOOK.md`](RUNBOOK.md)** | What exact command do I run right now, for deploy/verify/destroy? | Every session — this is your day-to-day cheat sheet |
 | **[`POC.md`](POC.md)** | Why did we design it this way? (ALB vs nginx, no API Gateway, network layout, per-service breakdown) | When you need the reasoning behind a decision — e.g. for an interview |
 
@@ -121,6 +121,75 @@ graph TB
     NAT --> PrivB
 ```
 
+#### Running in all three environments
+
+Since Phase 10, this module is invoked three times — once per environment folder in `live/` — each with its own CIDR block, fully isolated. Click an environment below to see its actual values:
+
+<details>
+<summary><b>POC</b> — <code>live/poc/vpc/</code></summary>
+
+```mermaid
+graph TB
+    subgraph VPC["acme-cloud-poc-vpc — 10.0.0.0/16"]
+        PubA["Public 10.0.0.0/24 (1a)"]
+        PubB["Public 10.0.1.0/24 (1b)"]
+        PrivA["Private 10.0.10.0/24 (1a)"]
+        PrivB["Private 10.0.11.0/24 (1b)"]
+        IGW[acme-cloud-poc-igw]
+        NAT[acme-cloud-poc-nat]
+    end
+    IGW <--> PubA
+    IGW <--> PubB
+    PubA --- NAT
+    NAT --> PrivA
+    NAT --> PrivB
+```
+</details>
+
+<details>
+<summary><b>DEV</b> — <code>live/dev/vpc/</code></summary>
+
+```mermaid
+graph TB
+    subgraph VPC["acme-cloud-dev-vpc — 10.1.0.0/16"]
+        PubA["Public 10.1.0.0/24 (1a)"]
+        PubB["Public 10.1.1.0/24 (1b)"]
+        PrivA["Private 10.1.10.0/24 (1a)"]
+        PrivB["Private 10.1.11.0/24 (1b)"]
+        IGW[acme-cloud-dev-igw]
+        NAT[acme-cloud-dev-nat]
+    end
+    IGW <--> PubA
+    IGW <--> PubB
+    PubA --- NAT
+    NAT --> PrivA
+    NAT --> PrivB
+```
+</details>
+
+<details>
+<summary><b>QA</b> — <code>live/qa/vpc/</code></summary>
+
+```mermaid
+graph TB
+    subgraph VPC["acme-cloud-qa-vpc — 10.2.0.0/16"]
+        PubA["Public 10.2.0.0/24 (1a)"]
+        PubB["Public 10.2.1.0/24 (1b)"]
+        PrivA["Private 10.2.10.0/24 (1a)"]
+        PrivB["Private 10.2.11.0/24 (1b)"]
+        IGW[acme-cloud-qa-igw]
+        NAT[acme-cloud-qa-nat]
+    end
+    IGW <--> PubA
+    IGW <--> PubB
+    PubA --- NAT
+    NAT --> PrivA
+    NAT --> PrivB
+```
+</details>
+
+Same `modules/vpc/main.tf`, three separate VPCs, zero overlapping IP ranges — non-overlapping CIDRs chosen deliberately in case peering/Transit Gateway is ever needed between environments later.
+
 ### Phase 3 — EKS Cluster + Node Group
 
 **What exists:**
@@ -202,6 +271,54 @@ Prefix delegation is baseline best practice in real EKS clusters regardless of i
 - Still enable prefix delegation regardless of that sizing, purely for IP efficiency
 - Use **Cluster Autoscaler** (Phase 11 on our roadmap) to add/remove nodes automatically based on real scheduling pressure, instead of a fixed `desired_size` — so capacity grows and shrinks with actual traffic rather than being manually tuned
 
+#### Running in all three environments
+
+Same `modules/eks/` module, three separate clusters — each with its own control plane, its own node group, its own dedicated worker nodes. `dev`/`qa` run fewer nodes since they're lower-traffic, non-production environments; the max-pods/prefix-delegation fix above applies identically to all three, since it lives in the module, not per-environment config.
+
+<details>
+<summary><b>POC</b> — <code>live/poc/eks/</code></summary>
+
+```mermaid
+graph TB
+    CP[acme-cloud-poc-eks<br/>control plane]
+    N1[node 1 - t3.micro]
+    N2[node 2 - t3.micro]
+    N3[node 3 - t3.micro]
+    CP --> N1
+    CP --> N2
+    CP --> N3
+```
+desired=3, min=1, max=4
+</details>
+
+<details>
+<summary><b>DEV</b> — <code>live/dev/eks/</code></summary>
+
+```mermaid
+graph TB
+    CP[acme-cloud-dev-eks<br/>control plane]
+    N1[node 1 - t3.micro]
+    N2[node 2 - t3.micro]
+    CP --> N1
+    CP --> N2
+```
+desired=2, min=1, max=3
+</details>
+
+<details>
+<summary><b>QA</b> — <code>live/qa/eks/</code></summary>
+
+```mermaid
+graph TB
+    CP[acme-cloud-qa-eks<br/>control plane]
+    N1[node 1 - t3.micro]
+    N2[node 2 - t3.micro]
+    CP --> N1
+    CP --> N2
+```
+desired=2, min=1, max=3
+</details>
+
 ### Phase 4 — ECR Repos + RDS
 
 **What exists — ECR:**
@@ -249,6 +366,37 @@ graph TB
     DB -.credentials stored in.-> SM
 ```
 
+#### Running in all three environments
+
+ECR repos and RDS instances are **not shared** across environments — each environment gets its own 3 ECR repos and its own Postgres instance, so a `dev` image push never touches `poc`'s registry, and a `qa` database is empty/independent from `poc`'s real data.
+
+<details>
+<summary><b>POC</b> — <code>live/poc/ecr/</code> + <code>live/poc/rds/</code></summary>
+
+```
+ECR: acme-cloud-poc-frontend, acme-cloud-poc-backend, acme-cloud-poc-notification
+RDS: acme-cloud-poc-db (db.t3.micro)
+```
+</details>
+
+<details>
+<summary><b>DEV</b> — <code>live/dev/ecr/</code> + <code>live/dev/rds/</code></summary>
+
+```
+ECR: acme-cloud-dev-frontend, acme-cloud-dev-backend, acme-cloud-dev-notification
+RDS: acme-cloud-dev-db (db.t3.micro)
+```
+</details>
+
+<details>
+<summary><b>QA</b> — <code>live/qa/ecr/</code> + <code>live/qa/rds/</code></summary>
+
+```
+ECR: acme-cloud-qa-frontend, acme-cloud-qa-backend, acme-cloud-qa-notification
+RDS: acme-cloud-qa-db (db.t3.micro)
+```
+</details>
+
 ### Phase 5 — IAM OIDC Provider for GitHub Actions
 
 **What exists:**
@@ -288,6 +436,39 @@ sequenceDiagram
     GH->>ECR: push image (ecr-push policy)
     GH->>EKS: kubectl apply (via EKS Access Entry → EditPolicy)
 ```
+
+#### Running in all three environments
+
+The GitHub OIDC **provider** itself is account-wide — AWS only allows one OIDC provider per issuer URL, so it's created once and every environment's deploy role trusts the same provider. What differs per environment is the **deploy role** and its EKS Access Entry, each pointing at that environment's own cluster:
+
+<details>
+<summary><b>POC</b> — <code>live/poc/iam-oidc/</code></summary>
+
+```
+Role: acme-cloud-poc-github-deploy-role
+Access Entry → acme-cloud-poc-eks (AmazonEKSEditPolicy)
+```
+</details>
+
+<details>
+<summary><b>DEV</b> — <code>live/dev/iam-oidc/</code></summary>
+
+```
+Role: acme-cloud-dev-github-deploy-role
+Access Entry → acme-cloud-dev-eks (AmazonEKSEditPolicy)
+```
+</details>
+
+<details>
+<summary><b>QA</b> — <code>live/qa/iam-oidc/</code></summary>
+
+```
+Role: acme-cloud-qa-github-deploy-role
+Access Entry → acme-cloud-qa-eks (AmazonEKSEditPolicy)
+```
+</details>
+
+A workflow pointed at the wrong environment's role simply can't reach the other environment's cluster — the Access Entry is the actual enforcement boundary, not just the IAM trust policy.
 
 ### Phase 6 — AWS Load Balancer Controller
 
@@ -333,6 +514,40 @@ graph TB
     Pod1 -->|creates via IRSA creds| ALB[Real ALB in AWS]
     ALB -->|placed using subnet tags| Pub[Public subnets, Phase 2]
 ```
+
+#### Running in all three environments
+
+Unlike the GitHub OIDC provider (Phase 5, account-wide), **each cluster has its own EKS OIDC provider** — IRSA is cluster-scoped by design. So `poc`, `dev`, and `qa` each run their own AWS Load Balancer Controller, with its own IRSA role, watching only its own cluster's Ingress resources.
+
+<details>
+<summary><b>POC</b> — <code>live/poc/alb-controller/</code></summary>
+
+```
+Role: acme-cloud-poc-alb-controller-role
+IRSA via: acme-cloud-poc-eks's own OIDC provider
+Controls ALBs in: acme-cloud-poc-vpc only
+```
+</details>
+
+<details>
+<summary><b>DEV</b> — <code>live/dev/alb-controller/</code></summary>
+
+```
+Role: acme-cloud-dev-alb-controller-role
+IRSA via: acme-cloud-dev-eks's own OIDC provider
+Controls ALBs in: acme-cloud-dev-vpc only
+```
+</details>
+
+<details>
+<summary><b>QA</b> — <code>live/qa/alb-controller/</code></summary>
+
+```
+Role: acme-cloud-qa-alb-controller-role
+IRSA via: acme-cloud-qa-eks's own OIDC provider
+Controls ALBs in: acme-cloud-qa-vpc only
+```
+</details>
 
 ### Phase 7 — External Secrets Operator + Secrets Manager Wiring
 
@@ -381,6 +596,42 @@ graph TB
     Backend -.mounts.-> K8sSecret
     Notif -.mounts, same Secret, no ESO changes.-> K8sSecret
 ```
+
+#### Running in all three environments
+
+Each environment's ESO reads from **its own environment's RDS secret** (Phase 4) — `dev`'s ESO can never sync `poc`'s database credentials, since the IAM role scoping and the secret ARN are both environment-specific.
+
+<details>
+<summary><b>POC</b> — <code>live/poc/external-secrets/</code></summary>
+
+```
+ESO role: acme-cloud-poc-external-secrets-role
+Reads secret: acme-cloud-poc-rds-credentials only
+Syncs into: acme-cloud-poc-eks's default namespace
+```
+</details>
+
+<details>
+<summary><b>DEV</b> — <code>live/dev/external-secrets/</code></summary>
+
+```
+ESO role: acme-cloud-dev-external-secrets-role
+Reads secret: acme-cloud-dev-rds-credentials only
+Syncs into: acme-cloud-dev-eks's default namespace
+```
+</details>
+
+<details>
+<summary><b>QA</b> — <code>live/qa/external-secrets/</code></summary>
+
+```
+ESO role: acme-cloud-qa-external-secrets-role
+Reads secret: acme-cloud-qa-rds-credentials only
+Syncs into: acme-cloud-qa-eks's default namespace
+```
+</details>
+
+**This is the last infrastructure phase (2-7) that varies per environment.** Phases 8-10 below are application deployments — the same app code runs in whichever environment's cluster you point `kubectl`/CI at (via that environment's `kubeconfig` and deploy role from Phase 5); the app manifests themselves don't change per environment.
 
 ### Phase 8 — backend-service (first application repo, deployed)
 
@@ -647,19 +898,117 @@ ECR notification:     338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-po
 
 ---
 
+## Infrastructure structure: `modules/` + `live/` (Terragrunt, multi-environment)
+
+**This replaced the old flat `terraform/` folder after Phase 10.** The original structure had one `terraform/<service>/` folder per resource type, each with its own hardcoded S3 backend block and its own `data "terraform_remote_state"` reads to find sibling modules' outputs — fine for a single environment, but meant standing up a second environment would have required copy-pasting all 7 folders and hand-editing every backend block and hardcoded value inside them.
+
+- **`modules/`** — the actual resource logic (7 modules: `vpc`, `eks`, `ecr`, `rds`, `iam-oidc`, `alb-controller`, `external-secrets`). Every resource built across Phases 2-7 lives here, environment-agnostic — no hardcoded environment name, CIDR, or backend.
+- **`live/`** — one tiny `terragrunt.hcl` wrapper per module per environment (~10-40 lines each): which module to use, and that environment's specific input values. `live/terragrunt.hcl` at the root is inherited by every wrapper below it — it auto-generates the S3 backend block and AWS provider block for every module, so neither is ever hand-written again. Modules pass outputs to each other via Terragrunt `dependency` blocks instead of the old `terraform_remote_state` data source.
+
+**Three fully isolated environments are running — `poc`, `dev`, `qa`** — each with its own VPC, EKS cluster, RDS instance, and IAM roles. Nothing shared between them except the module code they're built from and the one S3 bucket their state files live in (each environment gets its own state key inside that bucket — `poc/vpc/terraform.tfstate`, `dev/vpc/terraform.tfstate`, `qa/vpc/terraform.tfstate` — no collisions). **Exactly how each environment runs each phase is documented inline, phase by phase, above** — click the POC / DEV / QA sections under Phases 2 through 7 to see that phase's actual values per environment.
+
+**Adding a new environment costs ~7 small `.hcl` files with different input values — zero duplicated Terraform code.** `diff live/poc/vpc/terragrunt.hcl live/dev/vpc/terragrunt.hcl` shows a ~3 line difference (CIDR + environment name); `modules/vpc/main.tf` — the actual 100+ lines of resource logic — was never touched or copied to create `dev` or `qa`.
+
+### Full picture — all three environments, connected
+
+```mermaid
+graph TB
+    subgraph Modules["modules/ — resource logic, written once"]
+        MVpc[vpc]
+        MEks[eks]
+        MRds[rds]
+        MEcr[ecr]
+        MIam[iam-oidc]
+        MAlb[alb-controller]
+        MEso[external-secrets]
+    end
+
+    subgraph Root["live/terragrunt.hcl — inherited by every environment"]
+        Backend[generates backend.tf per module]
+        Provider[generates provider.tf per module]
+    end
+
+    subgraph POC["live/poc/ — RUNNING — 10.0.0.0/16"]
+        PVpc[VPC]
+        PEks[EKS: 3 nodes]
+        PRds[(RDS)]
+        PApps[backend + frontend + notification pods]
+    end
+
+    subgraph DEV["live/dev/ — RUNNING — 10.1.0.0/16"]
+        DVpc[VPC]
+        DEks[EKS: 2 nodes]
+        DRds[(RDS)]
+        DApps[backend + frontend + notification pods]
+    end
+
+    subgraph QA["live/qa/ — RUNNING — 10.2.0.0/16"]
+        QVpc[VPC]
+        QEks[EKS: 2 nodes]
+        QRds[(RDS)]
+        QApps[backend + frontend + notification pods]
+    end
+
+    Root -.generates backend+provider for.-> POC
+    Root -.generates backend+provider for.-> DEV
+    Root -.generates backend+provider for.-> QA
+
+    MVpc -.same module, different inputs.-> PVpc
+    MVpc -.-> DVpc
+    MVpc -.-> QVpc
+    MEks -.-> PEks
+    MEks -.-> DEks
+    MEks -.-> QEks
+    MRds -.-> PRds
+    MRds -.-> DRds
+    MRds -.-> QRds
+
+    PEks --> PVpc
+    PRds --> PVpc
+    PApps --> PEks
+    PApps --> PRds
+
+    DEks --> DVpc
+    DRds --> DVpc
+    DApps --> DEks
+    DApps --> DRds
+
+    QEks --> QVpc
+    QRds --> QVpc
+    QApps --> QEks
+    QApps --> QRds
+```
+
+Same module code (top), three independently running stacks (bottom) — no traffic, no state, no resource ever crosses between `poc`, `dev`, and `qa`.
+
+---
+
 ## Repo structure (this repo)
 
 ```
 platform-infrastructure/
-├── terraform/
+├── modules/                       ← resource logic, environment-agnostic
 │   ├── vpc/
 │   ├── eks/
-│   ├── rds/
 │   ├── ecr/
+│   ├── rds/
 │   ├── iam-oidc/
 │   ├── alb-controller/
-│   ├── external-secrets/
-│   └── monitoring/
+│   └── external-secrets/
+├── live/                          ← per-environment wrappers, no resource logic
+│   ├── terragrunt.hcl             ← root config: generates backend + provider for everything below
+│   ├── poc/                       ← applied, running
+│   │   ├── vpc/terragrunt.hcl
+│   │   ├── eks/terragrunt.hcl
+│   │   ├── ecr/terragrunt.hcl
+│   │   ├── rds/terragrunt.hcl
+│   │   ├── iam-oidc/terragrunt.hcl
+│   │   ├── alb-controller/terragrunt.hcl
+│   │   └── external-secrets/terragrunt.hcl
+│   ├── dev/                       ← running
+│   │   └── (same 7 module wrappers as poc, different inputs)
+│   └── qa/                        ← running
+│       └── (same 7 module wrappers as poc, different inputs)
 ├── helm/
 │   └── (base charts / shared values)
 ├── kubernetes/

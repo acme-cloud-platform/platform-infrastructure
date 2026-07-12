@@ -18,14 +18,35 @@ See `Must-Manual-setup.md` for:
 
 ---
 
+## Terragrunt basics (read this once, before deploying any module below)
+
+**Since Phase 10, all Terraform commands below run through `terragrunt`, not `terraform` directly.** The old flat `terraform/<module>/` folders are gone — replaced by `modules/` (environment-agnostic resource logic) + `live/<env>/<module>/` (tiny per-environment wrappers). Three environments exist and are all running: `poc`, `dev`, `qa`.
+
+**Every command below is shown for `poc` — to run it against `dev` or `qa` instead, just swap the path:**
+```bash
+cd platform-infrastructure/live/poc/vpc    # poc
+cd platform-infrastructure/live/dev/vpc    # dev — same commands, different folder
+cd platform-infrastructure/live/qa/vpc     # qa — same commands, different folder
+```
+
+**Always use `terragrunt`, never plain `terraform`, inside any `live/*/*/` folder.** `terragrunt init` sets up an isolated `.terragrunt-cache/` per module — a bare `terraform plan` run afterward looks at your actual working directory (which has no providers downloaded there) and fails with "Required plugins are not installed". This isn't a bug, just a command mixup — always `terragrunt <command>`.
+
+Install Terragrunt once, if not already done:
+```bash
+brew install terragrunt
+terragrunt --version
+```
+
+---
+
 ## Phase 2 — VPC / Networking
 
 ### Deploy
 ```bash
-cd platform-infrastructure/terraform/vpc
-terraform init
-terraform plan
-terraform apply
+cd platform-infrastructure/live/poc/vpc
+terragrunt init
+terragrunt plan
+terragrunt apply
 ```
 
 ### Verify
@@ -36,12 +57,12 @@ aws ec2 describe-vpcs --filters "Name=tag:Name,Values=acme-cloud-poc-vpc"
 # Confirm subnets
 aws ec2 describe-subnets --filters "Name=tag:Name,Values=acme-cloud-poc-*"
 ```
-Or just check AWS Console → VPC → Your VPCs → Resource map tab (shows subnets, route tables, IGW, NAT visually).
+Or just check AWS Console → VPC → Your VPCs → Resource map tab (shows subnets, route tables, IGW, NAT visually). For `dev`/`qa`, swap the `poc` tag filter values for `acme-cloud-dev-*` / `acme-cloud-qa-*`.
 
 ### Destroy (end of session, to stop billing)
 ```bash
-cd platform-infrastructure/terraform/vpc
-terraform destroy
+cd platform-infrastructure/live/poc/vpc
+terragrunt destroy
 ```
 
 ---
@@ -50,17 +71,20 @@ terraform destroy
 
 ### Deploy
 ```bash
-cd platform-infrastructure/terraform/eks
-terraform init
-terraform plan
-terraform apply
+cd platform-infrastructure/live/poc/eks
+terragrunt init
+terragrunt plan
+terragrunt apply
 ```
-⏱ Cluster creation: ~10 min. Node group creation: ~5-15 min (longer if instance type gets rejected — see troubleshooting below).
+⏱ Cluster creation: ~10 min. Node group creation: ~5-15 min (longer if instance type gets rejected — see troubleshooting below). Requires `vpc` (previous step) already applied — `terragrunt`'s `dependency` block reads its outputs automatically, no manual wiring needed.
 
 ### Connect kubectl to the cluster
 ```bash
 aws eks update-kubeconfig --name acme-cloud-poc-eks --region us-east-1
+# for dev:  --name acme-cloud-dev-eks
+# for qa:   --name acme-cloud-qa-eks
 ```
+`kubectl` only ever points at one cluster at a time — switch contexts with `kubectl config use-context <context-name>` or just re-run `update-kubeconfig` for whichever environment you're working in. `kubectl config get-contexts` lists all clusters you've connected to so far.
 
 ### Verify — this is the real proof it's working
 ```bash
@@ -93,13 +117,13 @@ aws autoscaling describe-auto-scaling-groups \
 
 ### Destroy (end of session, to stop billing)
 ```bash
-cd platform-infrastructure/terraform/eks
-terraform destroy
+cd platform-infrastructure/live/poc/eks
+terragrunt destroy
 ```
 Then destroy the VPC too (eks depends on vpc, so eks must go first):
 ```bash
 cd ../vpc
-terraform destroy
+terragrunt destroy
 ```
 
 ---
@@ -108,24 +132,25 @@ terraform destroy
 
 ### Deploy ECR (no dependencies — can run any time)
 ```bash
-cd platform-infrastructure/terraform/ecr
-terraform init
-terraform plan
-terraform apply
+cd platform-infrastructure/live/poc/ecr
+terragrunt init
+terragrunt plan
+terragrunt apply
 ```
 
 ### Deploy RDS (depends on vpc + eks — both must be up first)
 ```bash
 cd ../rds
-terraform init
-terraform plan
-terraform apply
+terragrunt init
+terragrunt plan
+terragrunt apply
 ```
 
 ### Verify ECR
 ```bash
 aws ecr describe-repositories --query 'repositories[].repositoryName'
 ```
+Shows all environments' repos together (e.g. `acme-cloud-poc-backend`, `acme-cloud-dev-backend`, `acme-cloud-qa-backend`) since ECR is listed account-wide, not per-environment — filter by name prefix if you only want one environment's repos.
 
 ### Verify RDS
 ```bash
@@ -139,8 +164,8 @@ aws secretsmanager describe-secret --secret-id acme-cloud-poc-rds-credentials
 
 ### Destroy (end of session)
 ```bash
-cd terraform/rds && terraform destroy   # rds first (depends on eks/vpc)
-cd ../ecr && terraform destroy           # ecr independent, any order is fine
+cd live/poc/rds && terragrunt destroy   # rds first (depends on eks/vpc)
+cd ../ecr && terragrunt destroy          # ecr independent, any order is fine
 ```
 
 ---
@@ -154,7 +179,7 @@ aws ec2 describe-instance-types \
   --filters "Name=free-tier-eligible,Values=true" \
   --query 'InstanceTypes[].InstanceType'
 ```
-Fix: set `node_instance_type` in `terraform/eks/variables.tf` to a Free Tier type (`t3.micro` / `t2.micro`), then `terraform apply` again — Terraform auto-detects the failed (tainted) node group and recreates it. Same fix pattern applies to `db_instance_class` in `terraform/rds/variables.tf` if RDS hits the same restriction.
+Fix: set `node_instance_type` in `live/<env>/eks/terragrunt.hcl`'s `inputs` block to a Free Tier type (`t3.micro` / `t2.micro`), then `terragrunt apply` again — Terraform auto-detects the failed (tainted) node group and recreates it. Same fix pattern applies to `db_instance_class` in `live/<env>/rds/terragrunt.hcl` if RDS hits the same restriction. Note this now lives in the `live/` wrapper's `inputs`, not in `modules/eks/variables.tf` — the module's `variable` block just defines the type and an unused fallback default; the real per-environment value is always set in `live/<env>/`.
 
 ### Node group stuck in "CREATING" for a long time
 Normal — first-time node group creation is the slowest step (15-25 min). Check real status instead of guessing:
@@ -163,8 +188,14 @@ aws eks describe-nodegroup --cluster-name acme-cloud-poc-eks --nodegroup-name ac
 ```
 Only worry if this returns `CREATE_FAILED` — check the node group's **Health** section in the AWS Console for the actual error message.
 
-### `terraform apply` warning: "dynamodb_table is deprecated"
-Harmless for now, still works. Future cleanup: migrate to `use_lockfile` parameter. Not urgent.
+### `terragrunt apply` warning: "dynamodb_table is deprecated"
+Harmless for now, still works. Future cleanup: migrate to `use_lockfile` parameter in `live/terragrunt.hcl`'s `remote_state` block. Not urgent.
+
+### Bare `terraform plan` fails with "Required plugins are not installed" right after `terragrunt init` succeeded
+Ran the wrong binary — `terragrunt init` sets up an isolated provider cache under `.terragrunt-cache/`, invisible to a plain `terraform` command run from the same folder. Always use `terragrunt plan` / `terragrunt apply` inside any `live/*/*/` folder, never bare `terraform`.
+
+### `WARN Using terragrunt.hcl as the root of Terragrunt configurations is an anti-pattern`
+Cosmetic warning from newer Terragrunt versions, nudging toward renaming `live/terragrunt.hcl` → `live/root.hcl` in a future cleanup. Doesn't block anything today — safe to ignore for now.
 
 ---
 
@@ -172,10 +203,10 @@ Harmless for now, still works. Future cleanup: migrate to `use_lockfile` paramet
 
 ### Deploy (depends on eks — access entries need the cluster to exist)
 ```bash
-cd platform-infrastructure/terraform/iam-oidc
-terraform init
-terraform plan
-terraform apply
+cd platform-infrastructure/live/poc/iam-oidc
+terragrunt init
+terragrunt plan
+terragrunt apply
 ```
 
 ### Verify
@@ -203,10 +234,11 @@ steps:
       role-to-assume: arn:aws:iam::338449997393:role/acme-cloud-poc-github-deploy-role
       aws-region: us-east-1
 ```
+For `dev`/`qa`, use `acme-cloud-dev-github-deploy-role` / `acme-cloud-qa-github-deploy-role` instead — each environment has its own deploy role, pointed at its own cluster via its own EKS Access Entry (see README.md Phase 5 for the full breakdown).
 
 ### Destroy (end of session)
 ```bash
-cd terraform/iam-oidc && terraform destroy
+cd live/poc/iam-oidc && terragrunt destroy
 ```
 
 ---
@@ -215,10 +247,10 @@ cd terraform/iam-oidc && terraform destroy
 
 ### Deploy (depends on vpc + eks)
 ```bash
-cd platform-infrastructure/terraform/alb-controller
-terraform init
-terraform plan
-terraform apply
+cd platform-infrastructure/live/poc/alb-controller
+terragrunt init
+terragrunt plan
+terragrunt apply
 ```
 ⏱ Takes 1-3 min — mostly Helm waiting for the controller pod to report Ready.
 
@@ -230,11 +262,11 @@ kubectl get pods -n kube-system | grep aws-load-balancer-controller
 # Check for clean startup, no crash loops
 kubectl logs -n kube-system deployment/aws-load-balancer-controller | tail -20
 ```
-Real proof it can create ALBs comes later (Phase 8/9) when we deploy a service with an actual `Ingress` resource and watch a real ALB appear in AWS Console.
+Real proof it can create ALBs comes later (Phase 8/9) when we deploy a service with an actual `Ingress` resource and watch a real ALB appear in AWS Console. Remember `kubectl` is pointed at whichever cluster you last ran `update-kubeconfig` for — double check `kubectl config current-context` if verifying a specific environment.
 
 ### Destroy (end of session)
 ```bash
-cd terraform/alb-controller && terraform destroy
+cd live/poc/alb-controller && terragrunt destroy
 ```
 
 ---
@@ -243,15 +275,12 @@ cd terraform/alb-controller && terraform destroy
 
 ### Deploy (depends on eks + rds + alb-controller — reuses its EKS OIDC provider)
 ```bash
-cd platform-infrastructure/terraform/external-secrets
-terraform init
-terraform plan
+cd platform-infrastructure/live/poc/external-secrets
+terragrunt init
+terragrunt plan
+terragrunt apply
 ```
-**Must apply in 2 steps** — `kubernetes_manifest` resources (SecretStore/ExternalSecret CRDs) fail plan-time validation if the CRDs don't exist in the cluster yet:
-```bash
-terraform apply -target=helm_release.eso -target=aws_iam_role_policy.eso_secrets_read -target=kubernetes_service_account.eso
-terraform apply
-```
+No more manual 2-step `-target` dance — Terragrunt's `dependency` blocks (on `eks`, `rds`, and `alb-controller`) resolve real outputs on `apply` and supply `mock_outputs` during `plan`, so the old CRD-not-installed-yet plan-time failure doesn't happen anymore as long as `eks`, `rds`, and `alb-controller` were applied first, in that order.
 
 ### Verify
 ```bash
@@ -263,7 +292,7 @@ kubectl get secret rds-credentials -n default
 
 ### Destroy (end of session)
 ```bash
-cd terraform/external-secrets && terraform destroy
+cd live/poc/external-secrets && terragrunt destroy
 ```
 
 ---
@@ -379,8 +408,8 @@ That line — a new order placed through `backend-service`, picked up by `notifi
 ### Confirm zero platform-infrastructure changes (the actual point of this phase)
 ```bash
 cd platform-infrastructure
-git log --oneline --since="whenever Phase 9 finished"   # should show no commits touching terraform/, helm/, or kubernetes/ for this service
-git diff HEAD~<phase-9-commit>..HEAD -- terraform/ helm/ kubernetes/   # should be empty
+git log --oneline --since="whenever Phase 9 finished"   # should show no commits touching modules/, live/, helm/, or kubernetes/ for this service
+git diff HEAD~<phase-9-commit>..HEAD -- modules/ live/ helm/ kubernetes/   # should be empty
 ```
 
 ### Destroy
@@ -430,7 +459,7 @@ Started with single-stage `python:3.12-slim` — Docker Desktop's scanner flagge
 
 ## EKS node group: max-pods fix (added mid-Phase 7)
 
-Ran into this rebuilding ESO — worth its own section since it touches the `eks/` module directly, not just external-secrets.
+Ran into this rebuilding ESO — worth its own section since it touches the `eks/` module directly, not just external-secrets. **Note: this happened before the Phase 10 Terragrunt restructure, so the commands below reflect the old `terraform/eks` path as actually run at the time. On the current structure, the equivalent commands are `cd live/poc/eks && terragrunt plan` / `terragrunt apply` — the underlying fix (custom launch template, explicit `--max-pods=110`) lives unchanged in `modules/eks/` today.**
 
 **Symptom**: pods stuck `Pending` forever, `kubectl get events` shows `0/2 nodes are available: 2 Too many pods`.
 
@@ -458,8 +487,8 @@ kubectl describe node <name> | grep -A3 "Allocatable"   # pods: should now read 
 ### "authentication mode must be set to API or API_AND_CONFIG_MAP"
 EKS clusters default to `CONFIG_MAP` auth mode, which doesn't support IAM Access Entries (needed for OIDC/GitHub Actions RBAC in Phase 5). Fix: add `access_config { authentication_mode = "API_AND_CONFIG_MAP" }` to the cluster resource. **Important**: also explicitly set `bootstrap_cluster_creator_admin_permissions = true` in the same block — leaving it unset makes Terraform think it changed and forces a full cluster + node group replacement (30+ min). Setting it explicitly gives a clean in-place update instead.
 
-### `terraform init` fails mid-download with "connection reset by peer"
-Flaky network blip talking to releases.hashicorp.com, not a config issue. Just retry `terraform init` — providers already downloaded are cached, so retry is fast.
+### `terragrunt init` fails mid-download with "connection reset by peer"
+Flaky network blip talking to releases.hashicorp.com, not a config issue. Just retry `terragrunt init` — providers already downloaded are cached, so retry is fast.
 
 ### `kubernetes_manifest` resource fails: "no matches for kind X in group Y (CRD may not be installed)"
 Terraform validates `kubernetes_manifest` resources against the cluster's live API schema at plan time — but the CRD (from a Helm chart in the same apply) doesn't exist yet on a first-ever apply. Fix: apply the Helm release first with `-target`, then apply everything else in a second pass. Not a bug, this is standard/expected Terraform + CRD behavior.
@@ -486,28 +515,36 @@ Check, in order: (1) is `notification_state` actually being created — connect 
 
 ## Standard order of operations, every session
 
+Shown for `poc` — repeat the identical sequence from `live/dev/` or `live/qa/` to bring up/tear down those environments; the order and dependency logic is the same for all three.
+
 **Starting work:**
 ```bash
-cd terraform/vpc && terraform apply   # if not already up
-cd ../eks && terraform apply           # depends on vpc
-cd ../ecr && terraform apply           # independent
-cd ../rds && terraform apply           # depends on vpc + eks
-cd ../iam-oidc && terraform apply      # depends on eks
-cd ../alb-controller && terraform apply # depends on vpc + eks
-cd ../external-secrets && terraform apply -target=helm_release.eso -target=aws_iam_role_policy.eso_secrets_read -target=kubernetes_service_account.eso
-cd ../external-secrets && terraform apply   # 2nd pass, picks up CRD manifests
+cd platform-infrastructure/live/poc
+
+cd vpc && terragrunt apply               # if not already up
+cd ../eks && terragrunt apply             # depends on vpc
+cd ../ecr && terragrunt apply             # independent
+cd ../rds && terragrunt apply             # depends on vpc + eks
+cd ../iam-oidc && terragrunt apply        # depends on eks
+cd ../alb-controller && terragrunt apply  # depends on vpc + eks
+cd ../external-secrets && terragrunt apply # depends on eks + rds + alb-controller
+
 aws eks update-kubeconfig --name acme-cloud-poc-eks --region us-east-1
 kubectl get nodes                      # confirm healthy before continuing
 kubectl get pods -n default            # confirm backend-service, frontend-service, notification-service all Running
 ```
+No more 2-pass `-target` step for `external-secrets` — Terragrunt's `dependency` blocks handle the CRD-ordering problem that used to require it.
 
 **Ending work (always do this to avoid ongoing charges):**
 ```bash
-cd terraform/external-secrets && terraform destroy  # first
-cd ../alb-controller && terraform destroy  # so nothing hangs onto the ALB
-cd ../iam-oidc && terraform destroy   # independent, any order
-cd ../rds && terraform destroy                # rds first (depends on eks/vpc)
-cd ../ecr && terraform destroy                # independent, any order
-cd ../eks && terraform destroy                # eks before vpc
-cd ../vpc && terraform destroy                # vpc last
+cd platform-infrastructure/live/poc
+
+cd external-secrets && terragrunt destroy  # first
+cd ../alb-controller && terragrunt destroy  # so nothing hangs onto the ALB
+cd ../iam-oidc && terragrunt destroy   # independent, any order
+cd ../rds && terragrunt destroy                # rds first (depends on eks/vpc)
+cd ../ecr && terragrunt destroy                # independent, any order
+cd ../eks && terragrunt destroy                # eks before vpc
+cd ../vpc && terragrunt destroy                # vpc last
 ```
+Running all three environments simultaneously (`poc` + `dev` + `qa`) means 3x the running cost — remember to run this teardown sequence for every environment you brought up, not just one.
