@@ -342,6 +342,65 @@ Only destroy this AFTER backend's, or delete both together — since they share 
 
 ---
 
+## Phase 10 — notification-service (third app repo — background worker)
+
+Separate repo again. No `Service`, no `Ingress` — this is a background worker only, so there's nothing for a Service or Ingress to route to. Just a `Deployment`.
+
+### Deploy
+Same pattern as Phases 8/9 — push to `main`, the workflow runs automatically, no manual command needed:
+```bash
+cd notification-service
+git add .
+git commit -m "..."
+git push
+```
+Workflow does: OIDC auth (Phase 5 role, this repo was trusted from day one) → build/push image to ECR (`acme-cloud-poc-notification`) → substitute the image into `k8s/deployment.yaml` → `kubectl apply` → wait for rollout.
+
+### Verify
+```bash
+# Should show 1/1 Running — no Service, no Ingress to check, this pod isn't reachable from outside
+kubectl get pods -n default | grep notification-service
+
+# Real proof it's working: tail the logs and place a test order from another terminal
+kubectl logs deployment/notification-service --tail=20 -f
+```
+In a second terminal, place an order through the live app (same shared ALB as Phase 8/9):
+```bash
+curl -X POST http://<shared-alb-address>/api/order \
+  -H "Content-Type: application/json" \
+  -d '{"item":"phase10-test","quantity":1}'
+```
+Within one poll cycle (≤15s), the `kubectl logs -f` terminal should print a line like:
+```
+2026-07-12 07:57:27,437 INFO Notification sent: order #5 — phase10-test x1 (placed at 2026-07-12 07:57:16.935636+00:00)
+```
+That line — a new order placed through `backend-service`, picked up by `notification-service` polling the same database — is the actual proof this phase works, not just that the pod is `Running`.
+
+### Confirm zero platform-infrastructure changes (the actual point of this phase)
+```bash
+cd platform-infrastructure
+git log --oneline --since="whenever Phase 9 finished"   # should show no commits touching terraform/, helm/, or kubernetes/ for this service
+git diff HEAD~<phase-9-commit>..HEAD -- terraform/ helm/ kubernetes/   # should be empty
+```
+
+### Destroy
+```bash
+kubectl delete -f k8s/deployment.yaml
+```
+No `Service`/`Ingress` to clean up, and nothing here affects the shared ALB from Phase 8/9 — deleting this Deployment only stops the worker.
+
+---
+
+## Dockerfile hardening (notification-service)
+
+Same distroless pattern as backend-service (Phase 8) — multi-stage build, `python:3.11-slim` builder pinned to match `gcr.io/distroless/python3-debian12:nonroot`'s bundled Python exactly (the same `psycopg2` ABI-version gotcha applies here as it did for backend-service).
+
+Key difference from backend-service: **no exposed port, no web server at all** — this container's `CMD` is just `["app/worker.py"]`, an infinite polling loop with no HTTP listener. Since nothing external ever connects to this pod, there's no `EXPOSE`, no readiness/liveness HTTP probe, and no `Service`/`Ingress` manifests in `k8s/` — just a bare `Deployment`.
+
+**Debugging this one without a shell** (same distroless constraint as backend-service): since there's no HTTP endpoint to curl or probe, `kubectl logs -f` is the primary tool — the worker logs every poll-cycle action (notifications sent, errors + retries) via Python's standard `logging` module, which is what you actually watch to confirm it's alive and working, rather than a `/healthz`-style check.
+
+---
+
 ## Dockerfile hardening (frontend-service)
 
 Same distroless approach as backend, but nginx has no official distroless equivalent, so static files are served by a ~40-line zero-dependency Node HTTP server (`server.js`, built-in `http`/`fs` modules only) instead:
@@ -420,8 +479,10 @@ Vite requires `index.html` at the project root (same level as `package.json`), n
 ### Distroless container crash loops: `exec: "server.js": executable file not found in $PATH`
 Caused by setting `ENTRYPOINT ["server.js"]` in a Dockerfile whose base image (`gcr.io/distroless/nodejs*`) already has its own `ENTRYPOINT` baked in (pointing at the `node` binary). Setting `ENTRYPOINT` again **overrides** the base image's instead of combining with it, so Docker tries to execute the script directly as a binary. Fix: use `CMD [...]` instead of `ENTRYPOINT [...]` for the script — `CMD` combines with the base image's existing `ENTRYPOINT`, producing the correct `node server.js`.
 
----
+### `notification-service` pod runs but `kubectl logs` never shows a "Notification sent" line
+Check, in order: (1) is `notification_state` actually being created — connect and `SELECT * FROM notification_state;`, confirm it has a row with `id=1`; (2) is `last_notified_order_id` already ahead of the newest order (e.g. left over from an earlier test run against the same DB) — if so, older orders will never re-trigger, only genuinely new ones will; (3) confirm the pod is actually using the same `rds-credentials` Secret backend-service uses — `kubectl describe pod -n default -l app=notification-service` and check the env section resolves to the same `host`/`dbname` as backend-service's pod. This is a shared-database polling design, so almost every "it's silent" symptom traces back to state in the DB, not the pod itself.
 
+---
 
 ## Standard order of operations, every session
 
@@ -437,6 +498,7 @@ cd ../external-secrets && terraform apply -target=helm_release.eso -target=aws_i
 cd ../external-secrets && terraform apply   # 2nd pass, picks up CRD manifests
 aws eks update-kubeconfig --name acme-cloud-poc-eks --region us-east-1
 kubectl get nodes                      # confirm healthy before continuing
+kubectl get pods -n default            # confirm backend-service, frontend-service, notification-service all Running
 ```
 
 **Ending work (always do this to avoid ongoing charges):**

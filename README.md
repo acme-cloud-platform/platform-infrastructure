@@ -20,9 +20,9 @@ We have 3 docs now, each answering a different question. Read in this order the 
 | Repo | Purpose | Status |
 |---|---|---|
 | [`platform-infrastructure`](.) | Terraform, Helm, reusable CI/CD workflow | 🚧 in progress |
-| `frontend-service` | React app | ⬜ not started |
-| `backend-service` | FastAPI app | ⬜ not started |
-| `notification-service` | Worker service | ⬜ not started |
+| `frontend-service` | React app | ✅ deployed |
+| `backend-service` | FastAPI app | ✅ deployed |
+| `notification-service` | Worker service | ✅ deployed |
 
 ---
 
@@ -54,8 +54,8 @@ Update the checkbox as each phase completes. This is our single source of truth 
 - [✅] **Phase 6 — AWS Load Balancer Controller (Ingress → real ALB)**
 - [✅] **Phase 7 — External Secrets Operator + Secrets Manager wiring**
 - [✅] **Phase 8 — `backend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
-- [✅] **Phase 9 — `frontend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed** *(current)*
-- [ ] **Phase 10 — `notification-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed (zero infra changes)**
+- [✅] **Phase 9 — `frontend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
+- [✅] **Phase 10 — `notification-service`: Dockerfile, K8s manifests, deployed (zero infra changes)** *(current)*
 - [ ] **Phase 11 — Prometheus/Grafana + Cluster Autoscaler, verified under load**
 
 ---
@@ -204,8 +204,6 @@ Prefix delegation is baseline best practice in real EKS clusters regardless of i
 
 ### Phase 4 — ECR Repos + RDS
 
-
-
 **What exists — ECR:**
 | Repo | URL |
 |---|---|
@@ -225,8 +223,9 @@ Prefix delegation is baseline best practice in real EKS clusters regardless of i
 
 **How it connects:**
 - RDS security group `sg-0cc373dbdf0493486` allows inbound **only** from the **EKS cluster security group** (`sg-02080e5747d7198f9`, from Phase 3) on port 5432 — nothing else in the account, and nothing on the internet, can reach the database
-- DB credentials (username, password, host, port) are stored as JSON in Secrets Manager — this secret ARN is what **External Secrets Operator** (Phase 7, not built yet) will sync into a Kubernetes Secret
+- DB credentials (username, password, host, port) are stored as JSON in Secrets Manager — this secret ARN is what **External Secrets Operator** (Phase 7) syncs into a Kubernetes Secret
 - ECR repos have zero network dependency — they're pulled into the picture only when the node IAM role (`acme-cloud-poc-eks-node-role`, Phase 3) uses its `AmazonEC2ContainerRegistryReadOnly` permission to pull images at pod-start time
+- The `acme-cloud-poc-notification` ECR repo, created here in Phase 4, sat unused until Phase 10 — proof that ECR repos for all 3 services were provisioned upfront, once, and never needed to change
 
 ```mermaid
 graph TB
@@ -266,7 +265,7 @@ graph TB
 2. GitHub mints a short-lived OIDC token, signed, claiming `repo:acme-cloud-platform/backend-service:*`
 3. The workflow calls AWS STS `AssumeRoleWithWebIdentity`, presenting that token
 4. AWS checks: does this token's issuer match `oidc-provider/token.actions.githubusercontent.com`? ✅ (the OIDC provider resource)
-5. AWS checks: does the `sub` claim in the token match one of the `StringLike` conditions on `acme-cloud-poc-github-deploy-role`'s trust policy? ✅ (repo is in the allowed list)
+5. AWS checks: does the `sub` claim in the token match one of the `StringLike` conditions on `acme-cloud-poc-github-deploy-role`'s trust policy? ✅ (repo is in the allowed list — `notification-service` was listed here from day one, in Phase 5, long before it existed as a real deployed service)
 6. AWS issues **temporary credentials**, scoped to this role, valid only for the workflow run's duration — no static key was ever stored anywhere
 7. Those temporary credentials carry two attached inline policies: `ecr-push` (can push images to any of the 3 ECR repos from Phase 4) and `eks-describe` (can call `DescribeCluster`, needed for `aws eks update-kubeconfig`)
 8. Separately, the **EKS Access Entry** maps this same role ARN to `AmazonEKSEditPolicy` inside the cluster's own RBAC — this is what actually lets `kubectl apply` succeed once authenticated, since IAM permissions alone don't grant Kubernetes-level permissions
@@ -335,8 +334,6 @@ graph TB
     ALB -->|placed using subnet tags| Pub[Public subnets, Phase 2]
 ```
 
-
-
 ### Phase 7 — External Secrets Operator + Secrets Manager Wiring
 
 **What exists:**
@@ -353,7 +350,7 @@ graph TB
 - ESO's IAM role is scoped tightly: read-only, and only on the **one specific RDS secret ARN** from Phase 4, nothing else in Secrets Manager
 - Used `ClusterSecretStore` instead of namespaced `SecretStore` — the ESO ServiceAccount lives in the `external-secrets` namespace, but the synced Secret needs to land in `default` (where `backend-service` will run); namespaced `SecretStore` only allows same-namespace ServiceAccount references, `ClusterSecretStore` doesn't have that restriction
 - The `ExternalSecret` re-syncs hourly — if the RDS password ever rotates in Secrets Manager, the K8s Secret updates automatically, no redeploy needed
-- `backend-service` (Phase 8) will mount the `rds-credentials` K8s Secret directly as an env var/volume — it never talks to Secrets Manager or AWS APIs itself
+- `backend-service` (Phase 8) mounts the `rds-credentials` K8s Secret directly as an env var — it never talks to Secrets Manager or AWS APIs itself. **By Phase 10, this same Secret is consumed by 2 services** (`backend-service` and `notification-service`), with zero changes made here to support the second consumer
 
 **Also fixed in this phase — EKS `max-pods` limit:** hit a real scheduling wall building this (`t3.micro` nodes could only hold ~4 pods each, regardless of VPC CNI prefix delegation, because kubelet's `--max-pods` is set once at node boot from a static AWS table). Fixed with a custom launch template using AL2023 `nodeadm` config to explicitly set `--max-pods=110`, plus bumping to 3 nodes. Full detail in `RUNBOOK.md`.
 
@@ -372,7 +369,8 @@ graph TB
         ExtSecret[ExternalSecret<br/>rds-credentials]
     end
     K8sSecret[(K8s Secret<br/>rds-credentials)]
-    Backend[backend-service<br/>Phase 8, not built yet]
+    Backend[backend-service<br/>Phase 8]
+    Notif[notification-service<br/>Phase 10]
 
     EksOidc --> EsoRole
     EsoRole --> EsoPod
@@ -380,7 +378,8 @@ graph TB
     EsoPod --> CSS
     CSS --> ExtSecret
     ExtSecret -->|materializes| K8sSecret
-    Backend -.will mount.-> K8sSecret
+    Backend -.mounts.-> K8sSecret
+    Notif -.mounts, same Secret, no ESO changes.-> K8sSecret
 ```
 
 ### Phase 8 — backend-service (first application repo, deployed)
@@ -393,7 +392,6 @@ graph TB
 | Deployment | 2 replicas, resource requests/limits sized for `t3.micro` nodes |
 | Service | ClusterIP, internal only |
 | Ingress | triggers Phase 6's ALB Controller — real ALB provisioned automatically |
-| Live ALB | `k8s-default-backends-d8c2e36062-1677925831.us-east-1.elb.amazonaws.com` |
 | Endpoints | `GET /api/healthz`, `GET /api/readyz` (real RDS check), `POST /api/order`, `GET /api/orders` |
 
 **How it connects — first real end-to-end proof of every prior phase:**
@@ -447,7 +445,6 @@ graph TB
 | Static server | `server.js` — ~40-line zero-dependency Node HTTP server (no nginx; distroless has no official nginx equivalent) |
 | Deployment | 2 replicas, serves on port 8080 |
 | Ingress | path `/`, **merged into backend's ALB** via `IngressGroup` (`group.name: acme-cloud-poc`) instead of provisioning a second ALB |
-| Live app | same ALB as backend — `k8s-default-backends-...elb.amazonaws.com/` |
 
 **How it connects — the whole platform, proven together for the first time:**
 
@@ -457,6 +454,8 @@ graph TB
 - **First genuine end-to-end user-facing proof**: a browser hitting the ALB now renders a real React UI, submits an order through `/api/order`, and the order list re-fetches from `/api/orders` — the full path `browser → ALB → frontend pod` and `browser → ALB → backend pod → RDS` both work simultaneously, confirmed live.
 
 **Real issue hit and fixed**: initial distroless build set `ENTRYPOINT ["server.js"]`, which **overrode** the base image's existing `ENTRYPOINT ["/nodejs/bin/node"]` instead of combining with it — container tried to execute `server.js` directly as a binary and crash-looped with "executable file not found in $PATH". Fixed by using `CMD ["server.js"]` instead, so the final effective command becomes `node server.js`. Full detail in `RUNBOOK.md`.
+
+**Note on ALB address**: the ALB backing this shared IngressGroup was recreated after this phase (during Phase 10 verification) — current address is `k8s-acmecloudpoc-0f83fcb8f7-780986312.us-east-1.elb.amazonaws.com`, see Phase 10 and the Quick-reference table below for the current value.
 
 ```mermaid
 graph TB
@@ -483,9 +482,57 @@ graph TB
     BPod2 --> RDS
 ```
 
+### Phase 10 — notification-service (third application repo — proves the "zero infra changes" claim)
 
+**What exists:**
+| Resource | Value |
+|---|---|
+| Repo | `notification-service` (Python background worker, separate repo) |
+| Docker image | multi-stage — `python:3.11-slim` builder → `gcr.io/distroless/python3-debian12:nonroot` runtime |
+| Workload type | background polling worker — **no web server, no exposed port** |
+| Deployment | 1 replica (deliberate — see "Why only 1 replica" below) |
+| Service / Ingress | **none** — this pod only reaches out to RDS, nothing needs to reach in |
+| Poll interval | 15 seconds (`POLL_INTERVAL_SECONDS` env var) |
+| State tracking | `notification_state` table in the same Postgres DB — tracks `last_notified_order_id` so restarts don't resend old notifications |
+| Deploy method | same automated pipeline as Phases 8/9 — push to `main`, workflow handles OIDC auth, build/push to ECR, `kubectl apply` |
 
-### Full picture so far — everything connected (Phases 1-9)
+**How it connects — the whole point of this phase:**
+
+This is the deliberate proof of the platform's core design claim from `README.md`'s intro: *"Adding a new microservice never requires changing this repo."* Phase 10 adds a third, functionally different service (a worker, not a web app) and touches **zero files in `platform-infrastructure`**:
+
+- **CI/CD trust (Phase 5)**: `acme-cloud-poc-github-deploy-role`'s trust policy already listed `notification-service` as an allowed repo from the very first `terraform apply` in Phase 5 — long before this repo had a single line of code. No IAM change needed to onboard it.
+- **Image registry (Phase 4)**: the `acme-cloud-poc-notification` ECR repo was created in Phase 4, alongside frontend/backend, and sat empty until this phase pushed its first image.
+- **Secrets (Phase 7)**: reuses the exact same `rds-credentials` K8s Secret that `backend-service` already mounts — same 5 keys (`host`, `port`, `dbname`, `username`, `password`), same `secretKeyRef` pattern. External Secrets Operator needed zero new configuration to support a second consumer.
+- **Network (Phase 2 + 3)**: runs on the same private-subnet worker nodes as every other pod — no new subnet, no new security group, no new route.
+- **Database (Phase 4)**: connects to the same RDS instance `backend-service` writes to, reading the `orders` table `backend-service` created, and creating its own small `notification_state` tracking table alongside it — same database, no new RDS instance.
+
+**How the worker actually operates:**
+1. Polls `orders` in a loop, every 15 seconds, for any `id` greater than the last one it already processed
+2. For each new order found, logs a "notification sent" line (the POC's stand-in for a real notification channel like SES/SNS) and advances `last_notified_order_id`
+3. On any DB error mid-cycle, closes and reopens the connection, then retries next cycle — doesn't crash the pod on a transient DB hiccup
+
+**Why only 1 replica**: the "have I already notified on this order" check is a single shared counter row in Postgres, not a distributed lock. Two replicas polling simultaneously could both read the same "new" orders before either writes back the updated counter, causing duplicate notifications. A real production version of this would replace polling + a shared counter with a proper queue (SQS, with visibility timeouts) — which is safe to scale to many workers by design. For this POC, 1 replica is the correct, deliberate choice, not a limitation to "fix" later.
+
+**Deploy pipeline**: `notification-service/.github/workflows/deploy.yml` follows the exact same OIDC-auth → build → push → deploy pattern as `backend-service` and `frontend-service` — push to `main`, the workflow assumes `acme-cloud-poc-github-deploy-role` via OIDC, builds and pushes the image to `acme-cloud-poc-notification`, substitutes it into `k8s/deployment.yaml`, and runs `kubectl apply` + waits for rollout. No manual steps.
+
+```mermaid
+graph TB
+    subgraph Priv["Private Subnet"]
+        BPod[backend-service pods<br/>Phase 8]
+        NPod[notification-service pod<br/>Phase 10 — single replica]
+        RDS[(RDS Postgres<br/>orders + notification_state tables)]
+    end
+    Secret[(K8s Secret<br/>rds-credentials<br/>from Phase 7 — unchanged)]
+    ECR[ECR: acme-cloud-poc-notification<br/>created Phase 4, used here first]
+
+    BPod -->|writes new rows| RDS
+    NPod -->|polls every 15s, id > last_notified| RDS
+    NPod -->|logs notification, advances counter| RDS
+    Secret -.env vars, same Secret as backend.-> NPod
+    ECR -.image pulled by node role, Phase 3.-> NPod
+```
+
+### Full picture so far — everything connected (Phases 1-10)
 
 ```mermaid
 graph TB
@@ -527,10 +574,14 @@ graph TB
         K8sSecret[(K8s Secret<br/>rds-credentials)]
     end
 
-    subgraph App["Phase 8+9 — Full App"]
+    subgraph App["Phase 8+9 — Web-Facing App"]
         BackendPods[backend-service pods x2]
         FrontendPods[frontend-service pods x2]
         RealALB[Shared Live ALB]
+    end
+
+    subgraph Worker["Phase 10 — Background Worker"]
+        NotifPod[notification-service pod x1<br/>no Service, no Ingress]
     end
 
     Repos -->|OIDC token| Provider
@@ -554,10 +605,14 @@ graph TB
     EsoPod -->|syncs into| K8sSecret
     DeployRole -->|deploys| BackendPods
     DeployRole -->|deploys| FrontendPods
+    DeployRole -->|kubectl apply, same pipeline as Phase 8/9| NotifPod
     ECRRepos -->|image| BackendPods
     ECRRepos -->|image| FrontendPods
+    ECRRepos -->|image| NotifPod
     K8sSecret -.env vars.-> BackendPods
-    BackendPods -->|SG-restricted 5432| RDS
+    K8sSecret -.env vars, zero ESO changes.-> NotifPod
+    BackendPods -->|SG-restricted 5432, writes orders| RDS
+    NotifPod -->|SG-restricted 5432, polls orders| RDS
     RealALB -->|order 1, /api| BackendPods
     RealALB -->|order 10, /| FrontendPods
     RealALB -.-> Pub
@@ -580,14 +635,15 @@ EKS OIDC provider (IRSA):                arn:aws:iam::338449997393:oidc-provider
 ALB controller role:                       arn:aws:iam::338449997393:role/acme-cloud-poc-alb-controller-role
 External Secrets role:                       arn:aws:iam::338449997393:role/acme-cloud-poc-external-secrets-role
 K8s Secret (synced):                           rds-credentials (namespace: default)
-Shared live ALB (frontend + backend):            k8s-default-backends-d8c2e36062-1677925831.us-east-1.elb.amazonaws.com
+Shared live ALB (frontend + backend):            k8s-acmecloudpoc-0f83fcb8f7-780986312.us-east-1.elb.amazonaws.com
 ECR frontend:      338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-frontend
 ECR backend:        338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-backend
 ECR notification:     338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-notification
 ```
 
-*(Phases 10-11 will be appended here, in this same section, as we build them.)*
+*(Note: the shared ALB address above supersedes the earlier `k8s-default-backends-d8c2e36062-...` address recorded during Phase 8/9 — the ALB was recreated at some point before Phase 10 verification. If you have older notes with the previous address, use this one instead.)*
 
+*(Phase 11 will be appended here, in this same section, once we build it.)*
 
 ---
 
@@ -624,5 +680,19 @@ platform-infrastructure/
 ├── Dockerfile
 ├── helm-values.yaml
 ├── .github/workflows/deploy.yml   ← calls platform-infrastructure's reusable workflow
+└── README.md
+```
+
+`notification-service` follows the same shape, minus the parts a background worker doesn't need:
+
+```
+notification-service/
+├── app/
+│   └── worker.py
+├── Dockerfile
+├── requirements.txt
+├── k8s/
+│   └── deployment.yaml            ← no service.yaml, no ingress.yaml — nothing external reaches this pod
+├── .github/workflows/deploy.yml   ← same OIDC pipeline as backend/frontend-service
 └── README.md
 ```
