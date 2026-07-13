@@ -4,13 +4,14 @@ Central platform repo for the **Acme Cloud** microservices project — Terraform
 
 ## Documentation — start here
 
-We have 3 docs now, each answering a different question. Read in this order the first time:
+We have 4 docs now, each answering a different question. Read in this order the first time:
 
 | Doc | Answers | Read when |
 |---|---|---|
 | **This file (`README.md`)** | What is this project, what's the architecture, what phase are we on, how does everything connect | First, and any time you need the big picture |
 | **[`Must-Manual-setup.md`](Must-Manual-setup.md)** | How do I set up my machine from zero? (AWS account, IAM user, CLI, Terraform + Terragrunt install) | Once, before the very first `terragrunt init` |
 | **[`RUNBOOK.md`](RUNBOOK.md)** | What exact command do I run right now, for deploy/verify/destroy? | Every session — this is your day-to-day cheat sheet |
+| **[`Debug.md`](Debug.md)** | Something's broken — what happened before, and how was it fixed? | Only when you actually hit an error |
 | **[`POC.md`](POC.md)** | Why did we design it this way? (ALB vs nginx, no API Gateway, network layout, per-service breakdown) | When you need the reasoning behind a decision — e.g. for an interview |
 
 ---
@@ -228,48 +229,9 @@ graph TB
     Node2 -->|joins via kubelet| CP
 ```
 
-#### Pod density: prefix delegation + max-pods (why we needed both)
+#### Pod density configuration
 
-Hit a real scheduling wall building Phase 7 (External Secrets Operator): pods stuck `Pending` with `0/2 nodes available: Too many pods`. Root cause and full production reasoning below — this became a genuine platform-engineering problem, not just a config tweak.
-
-**Why `t3.micro` has a pod ceiling at all**
-
-Kubernetes doesn't limit pods-per-node by CPU/memory alone — on AWS, the kubelet also enforces `--max-pods`, a hard ceiling based on how many IP addresses the instance's Elastic Network Interfaces (ENIs) can hand out. Small instance types like `t3.micro` have very few ENI "slots," so by default they can only host a handful of pods (well under 10) — regardless of how much CPU/memory is actually free. This is a **networking limit, not a resource limit**, which is why `kubectl describe nodes` showed low CPU/memory usage even while pods failed to schedule.
-
-**Fix 1 — VPC CNI Prefix Delegation** (`ENABLE_PREFIX_DELEGATION=true`, `WARM_PREFIX_TARGET=1`)
-Instead of the CNI handing out pod IPs one-per-ENI-slot, prefix delegation lets it hand out entire `/28` IP prefixes per ENI slot — dramatically increasing how many IPs (and therefore pods) a single small instance can support, **at no extra EC2 cost**. This is standard practice on **every EKS cluster in production, regardless of node size** — not a POC-only workaround.
-
-**Fix 2 — Explicit `--max-pods=110` via custom launch template**
-Prefix delegation alone wasn't enough: the kubelet's `--max-pods` value is calculated once, at node boot, from a static AWS lookup table keyed on instance type — it doesn't automatically know prefix delegation happened. So even after enabling it, existing (and freshly-booted default) nodes kept their old low ceiling. The real fix required a **custom `aws_launch_template`** using the modern AL2023 `nodeadm` bootstrap format, explicitly setting `kubelet.flags: ["--max-pods=110"]` in the NodeConfig. This forces a node group replacement (~15-20 min) since AMI/bootstrap config changed — expected, not an error.
-
-**Fix 3 — 3 nodes instead of 2**
-Bumped `node_desired_size` 2 → 3 in the same change, so there's real headroom for controller pods (ALB Controller, ESO, CoreDNS, kube-proxy, aws-node) plus future application pods (Phase 8-10), without living right at the edge of the ceiling even with the higher max-pods value.
-
-```mermaid
-graph TB
-    subgraph Before["Before: default max-pods, no prefix delegation"]
-        B1[t3.micro node]
-        B2[ENI: few IP slots]
-        B3["~4 pods max<br/>(hard ceiling)"]
-        B1 --> B2 --> B3
-    end
-    subgraph After["After: prefix delegation + explicit max-pods"]
-        A1[t3.micro node]
-        A2[ENI: /28 prefix per slot<br/>many more IPs available]
-        A3[Launch template:<br/>nodeadm sets --max-pods=110]
-        A4["110 pods max<br/>(same instance type, same cost)"]
-        A1 --> A2
-        A1 --> A3
-        A2 --> A4
-        A3 --> A4
-    end
-```
-
-**Production framing — why this matters beyond just "fixing an error":**
-Prefix delegation is baseline best practice in real EKS clusters regardless of instance size — AWS's own EKS Best Practices Guide recommends it universally, and newer EKS clusters ship with it on by default. What is **not** standard production practice is running `t3.micro` at all — that instance size only exists in this build because of the AWS account's new-account Free Tier restriction (see Phase 3's resource table history / RUNBOOK troubleshooting). A real production cluster would:
-- Size nodes for actual workload CPU/memory requirements (e.g. `m5.large` or bigger), not forced into a tiny instance by an account restriction
-- Still enable prefix delegation regardless of that sizing, purely for IP efficiency
-- Use **Cluster Autoscaler** (Phase 11 on our roadmap) to add/remove nodes automatically based on real scheduling pressure, instead of a fixed `desired_size` — so capacity grows and shrinks with actual traffic rather than being manually tuned
+Every node runs with VPC CNI Prefix Delegation enabled (`ENABLE_PREFIX_DELEGATION=true`, `WARM_PREFIX_TARGET=1`) and an explicit `--max-pods=110` set via a custom launch template (AL2023 `nodeadm` bootstrap) — this is standard EKS best practice regardless of instance size, and what allows `t3.micro` nodes to host a realistic number of pods. Full rationale and the issue this originally solved are in `Debug.md`.
 
 #### Running in all three environments
 
@@ -567,8 +529,6 @@ Controls ALBs in: acme-cloud-qa-vpc only
 - The `ExternalSecret` re-syncs hourly — if the RDS password ever rotates in Secrets Manager, the K8s Secret updates automatically, no redeploy needed
 - `backend-service` (Phase 8) mounts the `rds-credentials` K8s Secret directly as an env var — it never talks to Secrets Manager or AWS APIs itself. **By Phase 10, this same Secret is consumed by 2 services** (`backend-service` and `notification-service`), with zero changes made here to support the second consumer
 
-**Also fixed in this phase — EKS `max-pods` limit:** hit a real scheduling wall building this (`t3.micro` nodes could only hold ~4 pods each, regardless of VPC CNI prefix delegation, because kubelet's `--max-pods` is set once at node boot from a static AWS table). Fixed with a custom launch template using AL2023 `nodeadm` config to explicitly set `--max-pods=110`, plus bumping to 3 nodes. Full detail in `RUNBOOK.md`.
-
 ```mermaid
 graph TB
     subgraph Secrets["Phase 4 — Data"]
@@ -654,10 +614,6 @@ Syncs into: acme-cloud-qa-eks's default namespace
 - **Ingress → ALB (Phase 6)**: creating the `Ingress` resource is what triggers AWS Load Balancer Controller to actually provision a real, internet-facing ALB — this was the first real-world test of that controller since it went live in Phase 6
 - **Network path**: `Internet → ALB (public subnet) → target group → pod (private subnet) → RDS (private subnet, SG-restricted to EKS nodes)`
 
-**Two real issues hit and fixed in this phase** (full detail in `RUNBOOK.md`):
-1. **Routing mismatch** — ALB forwards the full path including `/api`, but the app's routes weren't prefixed with `/api`, causing 404s. Fixed by mounting all routes under `APIRouter(prefix="/api")`.
-2. **Container vulnerabilities** — initial single-stage `python:3.12-slim` image flagged 1 critical + 2 high CVEs by Docker's scanner. Rebuilt as a multi-stage distroless image — no shell, no package manager, drastically smaller attack surface. Debugging without a shell relies on structured logs and `kubectl debug --image=busybox` (attaches a temporary sidecar debug container without modifying the production image).
-
 ```mermaid
 graph TB
     User((User / curl))
@@ -703,8 +659,6 @@ graph TB
 - **Same-origin API calls, zero CORS config**: because both services sit behind the same ALB/domain, the React app calls `/api/*` as a relative path — no cross-origin request, no CORS headers to manage on the backend.
 - **Same OIDC role, same CI/CD pattern**: `frontend-service`'s workflow reuses the exact same `acme-cloud-poc-github-deploy-role` from Phase 5 — its trust policy already listed this repo from the start.
 - **First genuine end-to-end user-facing proof**: a browser hitting the ALB now renders a real React UI, submits an order through `/api/order`, and the order list re-fetches from `/api/orders` — the full path `browser → ALB → frontend pod` and `browser → ALB → backend pod → RDS` both work simultaneously, confirmed live.
-
-**Real issue hit and fixed**: initial distroless build set `ENTRYPOINT ["server.js"]`, which **overrode** the base image's existing `ENTRYPOINT ["/nodejs/bin/node"]` instead of combining with it — container tried to execute `server.js` directly as a binary and crash-looped with "executable file not found in $PATH". Fixed by using `CMD ["server.js"]` instead, so the final effective command becomes `node server.js`. Full detail in `RUNBOOK.md`.
 
 **Note on ALB address**: the ALB backing this shared IngressGroup was recreated after this phase (during Phase 10 verification) — current address is `k8s-acmecloudpoc-0f83fcb8f7-780986312.us-east-1.elb.amazonaws.com`, see Phase 10 and the Quick-reference table below for the current value.
 
