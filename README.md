@@ -9,7 +9,7 @@ We have 4 docs now, each answering a different question. Read in this order the 
 | Doc | Answers | Read when |
 |---|---|---|
 | **This file (`README.md`)** | What is this project, what's the architecture, what phase are we on, how does everything connect | First, and any time you need the big picture |
-| **[`Must-Manual-setup.md`](Must-Manual-setup.md)** | How do I set up my machine from zero? (AWS account, IAM user, CLI, Terraform + Terragrunt install) | Once, before the very first `terragrunt init` |
+| **[`Must-Manual-setup.md`](Must-Manual-setup.md)** | How do I set up my machine from zero? | Once, move to `RUNBOOK.md` |
 | **[`RUNBOOK.md`](RUNBOOK.md)** | What exact command do I run right now, for deploy/verify/destroy? | Every session — this is your day-to-day cheat sheet |
 | **[`Debug.md`](Debug.md)** | Something's broken — what happened before, and how was it fixed? | Only when you actually hit an error |
 | **[`POC.md`](POC.md)** | Why did we design it this way? (ALB vs nginx, no API Gateway, network layout, per-service breakdown) | When you need the reasoning behind a decision — e.g. for an interview |
@@ -29,14 +29,22 @@ We have 4 docs now, each answering a different question. Read in this order the 
 
 ## Architecture at a glance
 
-**Network**: VPC → 2 public subnets (ALB, NAT Gateway) + 2 private subnets (EKS nodes, RDS)
+**Network**: VPC → 2 public subnets (ALB, NAT Gateway) + 2 private subnets (EKS nodes, RDS) 
+
 **Ingress**: AWS Load Balancer Controller provisions ALB directly from K8s Ingress resources — no nginx
+
 **Compute**: EKS + managed node group, autoscaled
+
 **Database**: RDS Postgres, private subnet only, no public access
+
 **Secrets**: Secrets Manager + External Secrets Operator → K8s Secrets
+
 **CI/CD auth**: GitHub OIDC → IAM role, zero static AWS keys anywhere
+
 **Registry**: 3 ECR repos (frontend, backend, notification)
+
 **Observability**: CloudWatch + Prometheus/Grafana
+
 **No API Gateway** — no external API product, ALB is sufficient
 
 Each service repo owns: source code, Dockerfile, Helm values, and a workflow file that calls this repo's reusable workflow. This repo owns: Terraform, base Helm charts, the reusable workflow. Adding a new microservice never requires changing this repo.
@@ -124,7 +132,9 @@ graph TB
 
 #### Running in all three environments
 
-Since Phase 10, this module is invoked three times — once per environment folder in `live/` — each with its own CIDR block, fully isolated. Click an environment below to see its actual values:
+Since Phase 10, this module is invoked three times — once per environment folder in `live/` — each with its own CIDR block, fully isolated.
+
+Click an environment below to see its actual values:
 
 <details>
 <summary><b>POC</b> — <code>live/poc/vpc/</code></summary>
@@ -853,12 +863,10 @@ ECR notification:     338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-po
 
 ## Infrastructure structure: `modules/` + `live/` (Terragrunt, multi-environment)
 
-**This replaced the old flat `terraform/` folder after Phase 10.** The original structure had one `terraform/<service>/` folder per resource type, each with its own hardcoded S3 backend block and its own `data "terraform_remote_state"` reads to find sibling modules' outputs — fine for a single environment, but meant standing up a second environment would have required copy-pasting all 7 folders and hand-editing every backend block and hardcoded value inside them.
-
 - **`modules/`** — the actual resource logic (7 modules: `vpc`, `eks`, `ecr`, `rds`, `iam-oidc`, `alb-controller`, `external-secrets`). Every resource built across Phases 2-7 lives here, environment-agnostic — no hardcoded environment name, CIDR, or backend.
 - **`live/`** — one tiny `terragrunt.hcl` wrapper per module per environment (~10-40 lines each): which module to use, and that environment's specific input values. `live/terragrunt.hcl` at the root is inherited by every wrapper below it — it auto-generates the S3 backend block and AWS provider block for every module, so neither is ever hand-written again. Modules pass outputs to each other via Terragrunt `dependency` blocks instead of the old `terraform_remote_state` data source.
 
-**Three fully isolated environments are running — `poc`, `dev`, `qa`** — each with its own VPC, EKS cluster, RDS instance, and IAM roles. Nothing shared between them except the module code they're built from and the one S3 bucket their state files live in (each environment gets its own state key inside that bucket — `poc/vpc/terraform.tfstate`, `dev/vpc/terraform.tfstate`, `qa/vpc/terraform.tfstate` — no collisions). **Exactly how each environment runs each phase is documented inline, phase by phase, above** — click the POC / DEV / QA sections under Phases 2 through 7 to see that phase's actual values per environment.
+**Three fully isolated environments are running — `poc`, `dev`, `qa`** — each with its own VPC, EKS cluster, RDS instance, and IAM roles. The one S3 bucket their state files live in (each environment gets its own state key inside that bucket — `poc/vpc/terraform.tfstate`, `dev/vpc/terraform.tfstate`, `qa/vpc/terraform.tfstate` — no collisions).
 
 **Adding a new environment costs ~7 small `.hcl` files with different input values — zero duplicated Terraform code.** `diff live/poc/vpc/terragrunt.hcl live/dev/vpc/terragrunt.hcl` shows a ~3 line difference (CIDR + environment name); `modules/vpc/main.tf` — the actual 100+ lines of resource logic — was never touched or copied to create `dev` or `qa`.
 
