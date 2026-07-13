@@ -846,7 +846,6 @@ ECR backend:        338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-
 ECR notification:     338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-notification
 ```
 
-*(Note: the shared ALB address above supersedes the earlier `k8s-default-backends-d8c2e36062-...` address recorded during Phase 8/9 — the ALB was recreated at some point before Phase 10 verification. If you have older notes with the previous address, use this one instead.)*
 
 *(Phase 11 will be appended here, in this same section, once we build it.)*
 
