@@ -57,14 +57,21 @@ This should print your Account ID, User ID, and ARN — if you see that, your CL
 
 ---
 
-## 5. Install Terraform (macOS)
+## 5. Install Terraform, Terragrunt (macOS)
 
 ```bash
 brew tap hashicorp/tap
 brew install hashicorp/tap/terraform
 terraform -version
+brew install terragrunt
+terragrunt --version
 ```
-Should print something like `Terraform v1.7.x` or higher.
+
+That's it — everything else below is automated.
+
+---
+
+Should print something like `Terraform v1.7.x` or higher, `Terragrunt v1.1.x` or higher
 
 ---
 
@@ -118,5 +125,5 @@ concurrent changes, versioned, and never touches Git.
 - [✅] IAM user created (not using root)
 - [✅] AWS CLI installed
 - [✅] `aws configure` done, `aws sts get-caller-identity` works
-- [✅] Terraform installed
+- [✅] Terraform, Terragrunt installed
 - [✅] S3 bucket + DynamoDB table created (backend bootstrap)
