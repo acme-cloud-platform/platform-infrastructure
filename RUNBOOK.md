@@ -8,12 +8,8 @@ This is the short version — the exact steps to get any environment up or down.
 
 Before anything else, do this once:
 
-1. Follow **`Must-Manual-setup.md`** — AWS account, IAM user, AWS CLI, `aws configure`, S3 bucket + DynamoDB table for Terraform state.
-2. Install Terragrunt:
-   ```bash
-   brew install terragrunt
-   terragrunt --version
-   ```
+1. Follow **`Must-Manual-setup.md`** — AWS account, IAM user, Terragrunt, AWS CLI, `aws configure`, S3 bucket + DynamoDB table for Terraform state.
+
 
 That's it — everything else below is automated.
 
