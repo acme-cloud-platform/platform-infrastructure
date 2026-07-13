@@ -7,6 +7,7 @@ resource "aws_ecr_repository" "service" {
 
   name                 = "${local.name}-${each.key}"
   image_tag_mutability = "IMMUTABLE" # once a tag (e.g. a commit SHA) is pushed, it can't be overwritten — prevents silent "latest got swapped" bugs
+  force_delete         = true 
 
   image_scanning_configuration {
     scan_on_push = true # auto-scans every pushed image for known CVEs

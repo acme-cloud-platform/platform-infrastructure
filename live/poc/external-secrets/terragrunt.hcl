@@ -13,7 +13,7 @@ dependency "eks" {
     cluster_endpoint               = "https://mock.eks.amazonaws.com"
     cluster_certificate_authority  = "bW9jaw=="
   }
-  mock_outputs_allowed_terraform_commands = ["plan", "validate"]
+  mock_outputs_allowed_terraform_commands = ["plan", "validate", "destroy"]
 }
 
 dependency "rds" {
@@ -21,7 +21,7 @@ dependency "rds" {
   mock_outputs = {
     db_secret_arn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:mock"
   }
-  mock_outputs_allowed_terraform_commands = ["plan", "validate"]
+  mock_outputs_allowed_terraform_commands = ["plan", "validate", "destroy"]
 }
 
 dependency "alb_controller" {
@@ -29,7 +29,7 @@ dependency "alb_controller" {
   mock_outputs = {
     eks_oidc_provider_arn = "arn:aws:iam::000000000000:oidc-provider/mock"
   }
-  mock_outputs_allowed_terraform_commands = ["plan", "validate"]
+  mock_outputs_allowed_terraform_commands = ["plan", "validate", "destroy"]
 }
 
 inputs = {
