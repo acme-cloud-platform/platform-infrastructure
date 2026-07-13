@@ -11,7 +11,7 @@ dependency "vpc" {
   mock_outputs = {
     vpc_id = "vpc-00000000000000000"
   }
-  mock_outputs_allowed_terraform_commands = ["plan", "validate"]
+  mock_outputs_allowed_terraform_commands = ["plan", "validate", "destroy"]
 }
 
 dependency "eks" {
@@ -21,7 +21,7 @@ dependency "eks" {
     cluster_endpoint               = "https://mock.eks.amazonaws.com"
     cluster_certificate_authority  = "bW9jaw=="
   }
-  mock_outputs_allowed_terraform_commands = ["plan", "validate"]
+  mock_outputs_allowed_terraform_commands = ["plan", "validate", "destroy"]
 }
 
 inputs = {

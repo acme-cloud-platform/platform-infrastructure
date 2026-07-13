@@ -7,6 +7,6 @@ terraform {
 }
 
 inputs = {
-  environment   = "poc"
+  environment   = "qa"
   service_names = ["frontend", "backend", "notification"]
 }
