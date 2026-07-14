@@ -68,29 +68,18 @@ run vpc
 run eks
 
 # Connect kubectl right after the cluster exists, not at the very end.
-# This matters: a STALE kubeconfig context left over from a previous/
-# different cluster (or a prior destroy+recreate of this same cluster,
-# which gets a new API server cert) can cause confusing, hard-to-diagnose
-# connection errors in every later step that talks to the cluster
-# (alb-controller, external-secrets) — even though those steps never
-# touch kubeconfig themselves, Terraform's kubernetes/helm providers
-# still end up reading whatever context is currently active.
 echo ""
 echo "=== Connecting kubectl to acme-cloud-poc-eks ==="
 aws eks update-kubeconfig --name "acme-cloud-poc-eks" --region us-east-1
 
 run ecr
-
-# Note: down-poc.sh force-deletes the RDS Secrets Manager secret
-# (--force-delete-without-recovery) instead of leaving it in Secrets
-# Manager's default 30-day recovery window. That's WHY this rds apply
-# can safely recreate 'acme-cloud-poc-rds-credentials' with the same
-# name every time — if it had gone through the default scheduled-deletion
-# path instead, this apply would fail with a name-already-scheduled-for-
-# deletion error until that window passed.
 run rds
 run iam-oidc
 run alb-controller
+
+# Cluster Autoscaler runs after alb-controller to reuse the OIDC setup
+# (Note: Using the exact folder name matching your directory tree)
+run cluster-autoscaler
 
 echo ""
 echo "--- external-secrets (step 1: helm + IAM, so CRDs exist) ---"
@@ -103,11 +92,18 @@ echo ""
 echo "--- external-secrets (step 2: CRD-dependent manifests) ---"
 run_terragrunt "$LIVE_DIR/external-secrets" apply -auto-approve
 
+# Deploy Prometheus and Grafana monitoring stacks
+run monitoring
+
 echo ""
 echo "=== Verifying ==="
 kubectl get nodes
 echo ""
 kubectl get pods -n default
+echo ""
+kubectl get pods -n kube-system
+echo ""
+kubectl get pods -n monitoring
 
 echo ""
 echo "=== poc is up ==="
