@@ -21,9 +21,9 @@ We have 4 docs now, each answering a different question. Read in this order the 
 | Repo | Purpose | Status |
 |---|---|---|
 | [`platform-infrastructure`](.) | Terraform, Helm, reusable CI/CD workflow | ✅ complete |
-| `frontend-service` | React app | ✅ deployed |
-| `backend-service` | FastAPI app | ✅ deployed |
-| `notification-service` | Worker service | ✅ deployed |
+| [`frontend-service`](https://github.com/acme-cloud-platform/frontend-service) | React app | ✅ deployed |
+| [`backend-service`](https://github.com/acme-cloud-platform/backend-service) | FastAPI app | ✅ deployed |
+| [`notification-service`](https://github.com/acme-cloud-platform/notification-service) | Worker service | ✅ deployed |
 
 ---
 
@@ -312,14 +312,13 @@ desired=2, min=1, max=3
 | Security group | `sg-0cc373dbdf0493486` |
 | Secrets Manager secret | `arn:aws:secretsmanager:us-east-1:338449997393:secret:acme-cloud-poc-rds-credentials-GLxxD4` |
 | Publicly accessible | `false` |
-| Secret recovery window | `0` days (force-delete on destroy, not the default 30) — see note below |
+| Secret recovery window | `0` days (force-delete on destroy, not the default 30) |
 
 **How it connects:**
 - RDS security group `sg-0cc373dbdf0493486` allows inbound **only** from the **EKS cluster security group** (`sg-02080e5747d7198f9`, from Phase 3) on port 5432 — nothing else in the account, and nothing on the internet, can reach the database
 - DB credentials (username, password, host, port) are stored as JSON in Secrets Manager — this secret ARN is what **External Secrets Operator** (Phase 7) syncs into a Kubernetes Secret
 - ECR repos have zero network dependency — they're pulled into the picture only when the node IAM role (`acme-cloud-poc-eks-node-role`, Phase 3) uses its `AmazonEC2ContainerRegistryReadOnly` permission to pull images at pod-start time
 - The `acme-cloud-poc-notification` ECR repo, created here in Phase 4, sat unused until Phase 10 — proof that ECR repos for all 3 services were provisioned upfront, once, and never needed to change
-- **`recovery_window_in_days = 0`**: Secrets Manager defaults to a 30-day soft-delete window. For a POC/dev environment that gets torn down and rebuilt often, that default blocks `terraform apply` from recreating a secret with the same name until the window lapses (`InvalidRequestException: already scheduled for deletion`). Setting it to `0` makes deletes immediate, so `down-poc.sh` → `up-poc.sh` cycles never collide on the secret name.
 
 ```mermaid
 graph TB
@@ -783,17 +782,12 @@ graph TB
 **How it connects:**
 
 - **Cluster Autoscaler and EBS CSI both reuse the same EKS OIDC provider from Phase 6** — same IRSA pattern as External Secrets (Phase 7) and ALB Controller (Phase 6) itself: one provider per cluster, referenced by every module that needs a pod to assume an AWS role, never recreated.
-- **Cluster Autoscaler needs zero manual ASG tagging.** EKS managed node groups (Phase 3) auto-tag their underlying Auto Scaling Group with `k8s.io/cluster-autoscaler/enabled=true` and `k8s.io/cluster-autoscaler/<cluster-name>=owned` — confirmed directly in the AWS Console. Cluster Autoscaler's `autoDiscovery.clusterName` setting finds that ASG using exactly those tags, with no ASG name or ARN hardcoded in Terraform.
-- **EBS CSI had to come before Monitoring, not after.** The cluster already had a `gp2` StorageClass from the EKS default addon set, but it used the deprecated **in-tree** `kubernetes.io/aws-ebs` provisioner, which no longer works on this cluster's Kubernetes version — Prometheus's PVC sat `Pending` forever with `unbound immediate PersistentVolumeClaims` until the EBS CSI driver (with its own `gp3` StorageClass using the current `ebs.csi.aws.com` provisioner) was applied first.
-- **Cluster Autoscaler correctly recognized that scaling wouldn't fix the stuck PVC** — its own logs showed `NotTriggerScaleUp: pod didn't trigger scale-up: 1 pod has unbound immediate PersistentVolumeClaims`, i.e. it knows a storage problem isn't solved by adding compute, and correctly did nothing until the real (EBS CSI) fix was applied.
-- **Grafana ships with zero pre-wired datasources on purpose** (`sidecar.datasources.enabled=false` in this module) — the Prometheus data source is added once, manually, through the Grafana UI (`http://prometheus-server.monitoring.svc.cluster.local`), then the community dashboard `1860` is imported on top of it. Kept manual deliberately for the POC rather than adding more Terraform-managed Grafana resources; noted here as the natural next automation step if this graduates past POC.
-- **Destroy order matters, and is enforced in `down-poc.sh`**: `monitoring` must be destroyed *before* `ebs-csi`, since Prometheus's PVC is a real EBS volume — tearing down the CSI driver first would orphan that volume in AWS with nothing left to detach/delete it, the same class of problem Phase 9/10 already solved for orphaned ALBs by deleting Ingress resources before `alb-controller`.
+- **Cluster Autoscaler needs zero manual ASG tagging.** EKS managed node groups (Phase 3) auto-tag their underlying Auto Scaling Group with `k8s.io/cluster-autoscaler/enabled=true` and `k8s.io/cluster-autoscaler/<cluster-name>=owned`. Cluster Autoscaler's `autoDiscovery.clusterName` setting finds that ASG using exactly those tags, with no ASG name or ARN hardcoded in Terraform.
+- **EBS CSI is applied before Monitoring** — Monitoring's Prometheus PVC binds against the `gp3` StorageClass that EBS CSI installs, so EBS CSI is a dependency of Monitoring, not the other way around.
+- **Grafana connects to Prometheus manually through the UI**, then imports community dashboard `1860` on top — kept manual deliberately for the POC rather than adding more Terraform-managed Grafana resources.
+- **Destroy order is the reverse of deploy order**, enforced in `down-poc.sh` — see the block below.
 
-**Verified live, end to end (not just "pods are Running"):**
-
-1. **Monitoring**: Prometheus `/targets` confirmed all scrape targets `UP`; Grafana connected to Prometheus as a data source (`Save & Test` succeeded); dashboard `1860` rendered live, moving CPU/memory/disk/network graphs for all 3 nodes.
-2. **Cluster Autoscaler — scale up**: `backend-service` deployment scaled from 2 → 150 replicas via `kubectl scale` (chosen deliberately over an HPA/`hey`-driven load test, since this cluster has no `metrics-server` installed yet, so no HPA can exist to react to CPU/traffic — Cluster Autoscaler itself only reacts to unschedulable pod count, not load, so this is the direct, correct trigger). Pods went `Pending` for lack of schedulable capacity → Cluster Autoscaler logged a scale-up event → node count went from 3 to 4 within ~2-3 minutes.
-3. **Cluster Autoscaler — scale down**: replicas scaled back down to 2. Confirmed the extra node was **not** removed immediately — by design, `scale-down-delay-after-add` (10 min) and `scale-down-unneeded-time` (10 min) both have to elapse first. Node count returned to 3 roughly 10-20 minutes later, watched live via `kubectl get nodes -w` and the Cluster Autoscaler pod logs.
+**Verified live under load:** Grafana dashboard `1860` showed live CPU/memory/disk/network for all 3 nodes; `backend-service` was scaled 2 → 150 → 2 replicas via `kubectl scale`, which drove Cluster Autoscaler through a real scale-up (node count 3 → 4) and, after its cooldown window, a scale-down back to 3 — watched live via `kubectl get nodes -w`. See `Debug.md` for anything that broke along the way and how it was fixed.
 
 ```mermaid
 graph TB
