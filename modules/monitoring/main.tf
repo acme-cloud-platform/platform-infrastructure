@@ -9,6 +9,7 @@ resource "helm_release" "prometheus" {
   name       = "prometheus"
   repository = "https://prometheus-community.github.io/helm-charts"
   chart      = "prometheus"
+  version    = var.prometheus_chart_version
   namespace  = kubernetes_namespace.monitoring.metadata[0].name
   atomic     = true
   timeout    = 600
@@ -36,13 +37,14 @@ resource "helm_release" "grafana" {
   name       = "grafana"
   repository = "https://grafana.github.io/helm-charts"
   chart      = "grafana"
+  version    = var.grafana_chart_version
   namespace  = kubernetes_namespace.monitoring.metadata[0].name
   atomic     = true
   timeout    = 600
 
-  set { 
-    name  = "adminPassword" 
-    value = "admin123" 
+  set_sensitive {
+    name  = "adminPassword"
+    value = var.grafana_admin_password
   }
   set { 
     name  = "resources.requests.memory" 

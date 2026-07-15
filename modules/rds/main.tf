@@ -13,7 +13,8 @@ resource "random_password" "db" {
 
 # ---------- Store credentials in Secrets Manager, not in Terraform state readably, not in Git ----------
 resource "aws_secretsmanager_secret" "db_credentials" {
-  name = "${local.name}-rds-credentials"
+  name                    = "${local.name}-rds-credentials"
+  recovery_window_in_days = 0 # POC only: allows immediate delete+recreate on teardown/rebuild without manual force-delete
 }
 
 resource "aws_secretsmanager_secret_version" "db_credentials" {

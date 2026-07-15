@@ -28,8 +28,8 @@ run_terragrunt() {
 
   if [[ $exit_code -ne 0 ]] && grep -q "Error acquiring the state lock" "$tmp_out"; then
     local lock_id
-    lock_id=$(grep -A1 -E '^\s*ID:' "$tmp_out" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
-
+    lock_id=$(grep -A1 -E 'ID:' "$tmp_out" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    
     if [[ -z "$lock_id" ]]; then
       echo "Lock error detected, but couldn't parse a Lock ID from the output. Manual intervention needed."
       rm -f "$tmp_out"
@@ -101,6 +101,22 @@ else
 fi
 
 run external-secrets
+
+# monitoring must be destroyed BEFORE ebs-csi. Prometheus's PVC is backed by
+# a real EBS volume provisioned through the ebs-csi driver — if the driver
+# (and its IAM role) is torn down first, there's nothing left to detach/
+# delete that volume cleanly, and it can orphan in AWS exactly like the ALB
+# did when destroyed out of order. Same reasoning as the Ingress-deletion
+# step above.
+run monitoring
+
+run cluster-autoscaler
+
+# ebs-csi must be destroyed AFTER monitoring (see above) but BEFORE
+# alb-controller, since its IAM role trusts the OIDC provider that
+# alb-controller owns/creates.
+run ebs-csi
+
 run alb-controller
 run iam-oidc
 run rds

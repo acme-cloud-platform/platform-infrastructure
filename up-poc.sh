@@ -27,7 +27,7 @@ run_terragrunt() {
 
   if [[ $exit_code -ne 0 ]] && grep -q "Error acquiring the state lock" "$tmp_out"; then
     local lock_id
-    lock_id=$(grep -A1 -E '^\s*ID:' "$tmp_out" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    lock_id=$(grep -A1 -E 'ID:' "$tmp_out" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
 
     if [[ -z "$lock_id" ]]; then
       echo "Lock error detected, but couldn't parse a Lock ID from the output. Manual intervention needed."
@@ -80,6 +80,12 @@ run alb-controller
 # Cluster Autoscaler runs after alb-controller to reuse the OIDC setup
 # (Note: Using the exact folder name matching your directory tree)
 run cluster-autoscaler
+
+# EBS CSI driver — also reuses the OIDC setup. Must run before monitoring,
+# since Prometheus's PVC needs a working default StorageClass (gp3, via the
+# CSI provisioner) to actually bind and leave the node group's default
+# in-tree "gp2" StorageClass alone (it no longer works on this K8s version).
+run ebs-csi
 
 echo ""
 echo "--- external-secrets (step 1: helm + IAM, so CRDs exist) ---"

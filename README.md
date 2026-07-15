@@ -20,7 +20,7 @@ We have 4 docs now, each answering a different question. Read in this order the 
 
 | Repo | Purpose | Status |
 |---|---|---|
-| [`platform-infrastructure`](.) | Terraform, Helm, reusable CI/CD workflow | 🚧 in progress |
+| [`platform-infrastructure`](.) | Terraform, Helm, reusable CI/CD workflow | ✅ complete |
 | `frontend-service` | React app | ✅ deployed |
 | `backend-service` | FastAPI app | ✅ deployed |
 | `notification-service` | Worker service | ✅ deployed |
@@ -29,11 +29,13 @@ We have 4 docs now, each answering a different question. Read in this order the 
 
 ## Architecture at a glance
 
-**Network**: VPC → 2 public subnets (ALB, NAT Gateway) + 2 private subnets (EKS nodes, RDS) 
+**Network**: VPC → 2 public subnets (ALB, NAT Gateway) + 2 private subnets (EKS nodes, RDS)
 
 **Ingress**: AWS Load Balancer Controller provisions ALB directly from K8s Ingress resources — no nginx
 
-**Compute**: EKS + managed node group, autoscaled
+**Compute**: EKS + managed node group, autoscaled via Cluster Autoscaler
+
+**Storage**: EBS CSI driver + gp3 StorageClass, for any workload needing persistent volumes
 
 **Database**: RDS Postgres, private subnet only, no public access
 
@@ -43,7 +45,7 @@ We have 4 docs now, each answering a different question. Read in this order the 
 
 **Registry**: 3 ECR repos (frontend, backend, notification)
 
-**Observability**: CloudWatch + Prometheus/Grafana
+**Observability**: Prometheus + Grafana
 
 **No API Gateway** — no external API product, ALB is sufficient
 
@@ -64,8 +66,8 @@ Update the checkbox as each phase completes. This is our single source of truth 
 - [✅] **Phase 7 — External Secrets Operator + Secrets Manager wiring**
 - [✅] **Phase 8 — `backend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
 - [✅] **Phase 9 — `frontend-service`: Dockerfile, K8s manifests, CI/CD pipeline, deployed**
-- [✅] **Phase 10 — `notification-service`: Dockerfile, K8s manifests, deployed (zero infra changes)** *(current)*
-- [ ] **Phase 11 — Prometheus/Grafana + Cluster Autoscaler, verified under load**
+- [✅] **Phase 10 — `notification-service`: Dockerfile, K8s manifests, deployed (zero infra changes)**
+- [✅] **Phase 11 — Prometheus/Grafana + Cluster Autoscaler + EBS CSI driver, verified under load** *(current — project complete)*
 
 ---
 
@@ -211,7 +213,7 @@ Same `modules/vpc/main.tf`, three separate VPCs, zero overlapping IP ranges — 
 | Cluster security group | `sg-02080e5747d7198f9` |
 | Cluster IAM role | `acme-cloud-poc-eks-cluster-role` (trusts `eks.amazonaws.com`) |
 | Node IAM role | `acme-cloud-poc-eks-node-role` — `arn:aws:iam::338449997393:role/acme-cloud-poc-eks-node-role` (trusts `ec2.amazonaws.com`) |
-| Node group | `acme-cloud-poc-nodes` — 3× `t3.micro`, private subnets only, `--max-pods=110` per node |
+| Node group | `acme-cloud-poc-nodes` — 3× `t3.micro`, private subnets only, `--max-pods=110` per node, `desired=3, min=1, max=4` |
 | Auth mode | `API_AND_CONFIG_MAP` (needed for Phase 5's access entries) |
 | Launch template | `acme-cloud-poc-nodes-*` — custom AL2023 `nodeadm` bootstrap, overrides max-pods |
 | VPC CNI addon | `ENABLE_PREFIX_DELEGATION=true`, `WARM_PREFIX_TARGET=1` |
@@ -221,6 +223,7 @@ Same `modules/vpc/main.tf`, three separate VPCs, zero overlapping IP ranges — 
 - Worker nodes (the actual EC2 instances) sit **only in private subnets** — no public IP, no direct internet exposure, all outbound traffic goes through the NAT Gateway
 - `acme-cloud-poc-eks-node-role` has 3 AWS-managed policies attached: `AmazonEKSWorkerNodePolicy` (talk to control plane), `AmazonEC2ContainerRegistryReadOnly` (pull images from ECR — connects to Phase 4), `AmazonEKS_CNI_Policy` (pod networking)
 - `acme-cloud-poc-eks-cluster-role` has `AmazonEKSClusterPolicy` attached — lets AWS manage the control plane on your behalf
+- The managed node group's underlying Auto Scaling Group is auto-tagged by EKS with `k8s.io/cluster-autoscaler/enabled=true` and `k8s.io/cluster-autoscaler/acme-cloud-poc-eks=owned` — this is what lets **Cluster Autoscaler (Phase 11)** discover and manage it with zero extra tagging config needed in this module
 
 ```mermaid
 graph TB
@@ -309,12 +312,14 @@ desired=2, min=1, max=3
 | Security group | `sg-0cc373dbdf0493486` |
 | Secrets Manager secret | `arn:aws:secretsmanager:us-east-1:338449997393:secret:acme-cloud-poc-rds-credentials-GLxxD4` |
 | Publicly accessible | `false` |
+| Secret recovery window | `0` days (force-delete on destroy, not the default 30) — see note below |
 
 **How it connects:**
 - RDS security group `sg-0cc373dbdf0493486` allows inbound **only** from the **EKS cluster security group** (`sg-02080e5747d7198f9`, from Phase 3) on port 5432 — nothing else in the account, and nothing on the internet, can reach the database
 - DB credentials (username, password, host, port) are stored as JSON in Secrets Manager — this secret ARN is what **External Secrets Operator** (Phase 7) syncs into a Kubernetes Secret
 - ECR repos have zero network dependency — they're pulled into the picture only when the node IAM role (`acme-cloud-poc-eks-node-role`, Phase 3) uses its `AmazonEC2ContainerRegistryReadOnly` permission to pull images at pod-start time
 - The `acme-cloud-poc-notification` ECR repo, created here in Phase 4, sat unused until Phase 10 — proof that ECR repos for all 3 services were provisioned upfront, once, and never needed to change
+- **`recovery_window_in_days = 0`**: Secrets Manager defaults to a 30-day soft-delete window. For a POC/dev environment that gets torn down and rebuilt often, that default blocks `terraform apply` from recreating a secret with the same name until the window lapses (`InvalidRequestException: already scheduled for deletion`). Setting it to `0` makes deletes immediate, so `down-poc.sh` → `up-poc.sh` cycles never collide on the secret name.
 
 ```mermaid
 graph TB
@@ -464,6 +469,8 @@ eks.amazonaws.com/role-arn: arn:aws:iam::338449997393:role/acme-cloud-poc-alb-co
 When the controller pod starts using that ServiceAccount, EKS automatically injects temporary AWS credentials scoped to that role — no secret, no key, ever stored in the cluster.
 
 Once running, the controller watches the Kubernetes API for `Ingress` resources. When `backend-service`/`frontend-service` (Phase 8/9) create one, the controller reads the subnet tags from Phase 2 (`kubernetes.io/role/elb` for public, `kubernetes.io/role/internal-elb` for private) to decide where to place the ALB, then calls the AWS ELB API directly using its IRSA credentials to actually create it.
+
+This module also creates the **EKS cluster's own OIDC provider resource** itself (`aws_iam_openid_connect_provider.eks`) — since an AWS account only gets one such provider per issuer URL, every later module needing IRSA (Cluster Autoscaler and EBS CSI driver, both in Phase 11; External Secrets in Phase 7) reads this same provider's ARN as a dependency instead of creating their own.
 
 ```mermaid
 graph TB
@@ -670,7 +677,7 @@ graph TB
 - **Same OIDC role, same CI/CD pattern**: `frontend-service`'s workflow reuses the exact same `acme-cloud-poc-github-deploy-role` from Phase 5 — its trust policy already listed this repo from the start.
 - **First genuine end-to-end user-facing proof**: a browser hitting the ALB now renders a real React UI, submits an order through `/api/order`, and the order list re-fetches from `/api/orders` — the full path `browser → ALB → frontend pod` and `browser → ALB → backend pod → RDS` both work simultaneously, confirmed live.
 
-**Note on ALB address**: the ALB backing this shared IngressGroup was recreated after this phase (during Phase 10 verification) — current address is `k8s-acmecloudpoc-0f83fcb8f7-780986312.us-east-1.elb.amazonaws.com`, see Phase 10 and the Quick-reference table below for the current value.
+**Note on ALB address**: the ALB backing this shared IngressGroup was recreated after this phase (during Phase 10 verification) — current address is `k8s-acmecloudpoc-0f83fcb8f7-780986312.us-east-1.elb.amazonaws.com`, see the Quick-reference table at the end of this file for the current value.
 
 ```mermaid
 graph TB
@@ -747,7 +754,132 @@ graph TB
     ECR -.image pulled by node role, Phase 3.-> NPod
 ```
 
-### Full picture so far — everything connected (Phases 1-10)
+### Phase 11 — Cluster Autoscaler + EBS CSI Driver + Prometheus/Grafana (verified under load)
+
+**What exists — Cluster Autoscaler:**
+| Resource | Value |
+|---|---|
+| IAM role | `acme-cloud-poc-cluster-autoscaler-role` (IRSA, trusts the EKS OIDC provider from Phase 6) |
+| Helm release | `cluster-autoscaler` chart `9.46.6`, image tag `v1.30.0`, namespace `kube-system` |
+| Discovery method | `autoDiscovery.clusterName=acme-cloud-poc-eks` — no ASG name hardcoded anywhere |
+| Node group bounds | `min=1, max=4` (set on the ASG in Phase 3) |
+
+**What exists — EBS CSI Driver:**
+| Resource | Value |
+|---|---|
+| IAM role | `acme-cloud-poc-ebs-csi-role` (IRSA, `AmazonEBSCSIDriverPolicy`) |
+| Install method | first-party EKS addon (`aws_eks_addon`, not Helm) — auto-patched by AWS for cluster version compatibility |
+| StorageClass | `gp3`, provisioner `ebs.csi.aws.com`, marked cluster-default |
+
+**What exists — Monitoring:**
+| Resource | Value |
+|---|---|
+| Namespace | `monitoring` |
+| Prometheus | `prometheus` chart `25.24.1` — server + node-exporter + kube-state-metrics |
+| Grafana | `grafana` chart `8.4.2`, admin password via `sensitive` Terraform variable (never hardcoded) |
+| Storage | Prometheus server PVC, backed by the `gp3` StorageClass above |
+| Dashboard used for verification | Grafana community dashboard **1860** ("Node Exporter Full") |
+
+**How it connects:**
+
+- **Cluster Autoscaler and EBS CSI both reuse the same EKS OIDC provider from Phase 6** — same IRSA pattern as External Secrets (Phase 7) and ALB Controller (Phase 6) itself: one provider per cluster, referenced by every module that needs a pod to assume an AWS role, never recreated.
+- **Cluster Autoscaler needs zero manual ASG tagging.** EKS managed node groups (Phase 3) auto-tag their underlying Auto Scaling Group with `k8s.io/cluster-autoscaler/enabled=true` and `k8s.io/cluster-autoscaler/<cluster-name>=owned` — confirmed directly in the AWS Console. Cluster Autoscaler's `autoDiscovery.clusterName` setting finds that ASG using exactly those tags, with no ASG name or ARN hardcoded in Terraform.
+- **EBS CSI had to come before Monitoring, not after.** The cluster already had a `gp2` StorageClass from the EKS default addon set, but it used the deprecated **in-tree** `kubernetes.io/aws-ebs` provisioner, which no longer works on this cluster's Kubernetes version — Prometheus's PVC sat `Pending` forever with `unbound immediate PersistentVolumeClaims` until the EBS CSI driver (with its own `gp3` StorageClass using the current `ebs.csi.aws.com` provisioner) was applied first.
+- **Cluster Autoscaler correctly recognized that scaling wouldn't fix the stuck PVC** — its own logs showed `NotTriggerScaleUp: pod didn't trigger scale-up: 1 pod has unbound immediate PersistentVolumeClaims`, i.e. it knows a storage problem isn't solved by adding compute, and correctly did nothing until the real (EBS CSI) fix was applied.
+- **Grafana ships with zero pre-wired datasources on purpose** (`sidecar.datasources.enabled=false` in this module) — the Prometheus data source is added once, manually, through the Grafana UI (`http://prometheus-server.monitoring.svc.cluster.local`), then the community dashboard `1860` is imported on top of it. Kept manual deliberately for the POC rather than adding more Terraform-managed Grafana resources; noted here as the natural next automation step if this graduates past POC.
+- **Destroy order matters, and is enforced in `down-poc.sh`**: `monitoring` must be destroyed *before* `ebs-csi`, since Prometheus's PVC is a real EBS volume — tearing down the CSI driver first would orphan that volume in AWS with nothing left to detach/delete it, the same class of problem Phase 9/10 already solved for orphaned ALBs by deleting Ingress resources before `alb-controller`.
+
+**Verified live, end to end (not just "pods are Running"):**
+
+1. **Monitoring**: Prometheus `/targets` confirmed all scrape targets `UP`; Grafana connected to Prometheus as a data source (`Save & Test` succeeded); dashboard `1860` rendered live, moving CPU/memory/disk/network graphs for all 3 nodes.
+2. **Cluster Autoscaler — scale up**: `backend-service` deployment scaled from 2 → 150 replicas via `kubectl scale` (chosen deliberately over an HPA/`hey`-driven load test, since this cluster has no `metrics-server` installed yet, so no HPA can exist to react to CPU/traffic — Cluster Autoscaler itself only reacts to unschedulable pod count, not load, so this is the direct, correct trigger). Pods went `Pending` for lack of schedulable capacity → Cluster Autoscaler logged a scale-up event → node count went from 3 to 4 within ~2-3 minutes.
+3. **Cluster Autoscaler — scale down**: replicas scaled back down to 2. Confirmed the extra node was **not** removed immediately — by design, `scale-down-delay-after-add` (10 min) and `scale-down-unneeded-time` (10 min) both have to elapse first. Node count returned to 3 roughly 10-20 minutes later, watched live via `kubectl get nodes -w` and the Cluster Autoscaler pod logs.
+
+```mermaid
+graph TB
+    subgraph OIDC6["Phase 6 — Shared EKS OIDC Provider"]
+        EksOidc[EKS OIDC Provider]
+    end
+
+    subgraph CA["Cluster Autoscaler"]
+        CaRole[cluster-autoscaler-role]
+        CaPod[cluster-autoscaler pod]
+    end
+
+    subgraph EbsCsi["EBS CSI Driver"]
+        EbsRole[ebs-csi-role]
+        EbsAddon[aws-ebs-csi-driver addon]
+        Gp3[gp3 StorageClass<br/>default]
+    end
+
+    subgraph Mon["Monitoring — namespace: monitoring"]
+        Prom[Prometheus server]
+        Graf[Grafana]
+        PVC[(Prometheus PVC)]
+    end
+
+    subgraph EKS["Phase 3 — EKS"]
+        ASG[Node group ASG<br/>auto-tagged k8s.io/cluster-autoscaler/*]
+        N3[3 nodes]
+        N4[+1 node under load]
+    end
+
+    subgraph Apps["Phase 8 — backend-service"]
+        Backend[backend-service pods<br/>scaled 2 to 150 to 2]
+    end
+
+    EksOidc --> CaRole
+    EksOidc --> EbsRole
+    CaRole --> CaPod
+    EbsRole --> EbsAddon
+    EbsAddon --> Gp3
+
+    CaPod -->|discovers via tags, no hardcoded ASG| ASG
+    ASG --> N3
+    Backend -->|150 replicas: pods Pending| CaPod
+    CaPod -->|scale_up| N4
+    Backend -.scaled back to 2, 10-20min cooldown.-> CaPod
+
+    Gp3 -->|bind| PVC
+    Prom --> PVC
+    Graf -->|data source| Prom
+```
+
+#### Running in all three environments
+
+Same pattern as every prior phase-11-and-earlier module: same Terraform code, environment-specific inputs. `dev` and `qa` are not yet applied for Phase 11 — only `poc` has been built and verified so far, using the exact deploy order below. Extending to `dev`/`qa` is just 3 new `terragrunt.hcl` wrapper files per environment (`cluster-autoscaler`, `ebs-csi`, `monitoring`), same as every other phase.
+
+<details>
+<summary><b>POC</b> — <code>live/poc/cluster-autoscaler/</code> + <code>live/poc/ebs-csi/</code> + <code>live/poc/monitoring/</code> — RUNNING, VERIFIED</summary>
+
+```
+Cluster Autoscaler role: acme-cloud-poc-cluster-autoscaler-role
+EBS CSI role:            acme-cloud-poc-ebs-csi-role
+Node group bounds:       min=1, max=4
+Monitoring namespace:    monitoring (Prometheus + Grafana, gp3-backed PVC)
+```
+</details>
+
+<details>
+<summary><b>DEV</b> — not yet applied</summary>
+
+Same 3 modules, same deploy order, `environment = "dev"` — planned next.
+</details>
+
+<details>
+<summary><b>QA</b> — not yet applied</summary>
+
+Same 3 modules, same deploy order, `environment = "qa"` — planned next.
+</details>
+
+**Deploy/destroy order** (enforced in `up-poc.sh` / `down-poc.sh`, see `RUNBOOK.md` for the full command sequence):
+
+```
+up:   ... -> alb-controller -> cluster-autoscaler -> ebs-csi -> external-secrets -> monitoring
+down: external-secrets -> monitoring -> cluster-autoscaler -> ebs-csi -> alb-controller -> ...
+```
+
+### Full picture — everything connected (Phases 1-11)
 
 ```mermaid
 graph TB
@@ -769,6 +901,7 @@ graph TB
         Cluster[EKS Cluster]
         Nodes[Worker Nodes]
         NodeRole[node-role]
+        ASG[Node group ASG<br/>auto-tagged for CA]
     end
 
     subgraph Data["Phase 4 — Data"]
@@ -790,13 +923,23 @@ graph TB
     end
 
     subgraph App["Phase 8+9 — Web-Facing App"]
-        BackendPods[backend-service pods x2]
+        BackendPods[backend-service pods x2, scaled to 150 in Phase 11]
         FrontendPods[frontend-service pods x2]
         RealALB[Shared Live ALB]
     end
 
     subgraph Worker["Phase 10 — Background Worker"]
         NotifPod[notification-service pod x1<br/>no Service, no Ingress]
+    end
+
+    subgraph P11["Phase 11 — Autoscale + Storage + Observability"]
+        CaRole[cluster-autoscaler-role]
+        CaPod[cluster-autoscaler pod]
+        EbsRole[ebs-csi-role]
+        EbsAddon[EBS CSI addon]
+        Gp3[gp3 StorageClass]
+        Prom[Prometheus]
+        Graf[Grafana]
     end
 
     Repos -->|OIDC token| Provider
@@ -832,6 +975,19 @@ graph TB
     RealALB -->|order 10, /| FrontendPods
     RealALB -.-> Pub
     FrontendPods -.same-origin fetch.-> RealALB
+
+    EksOidc --> CaRole
+    EksOidc --> EbsRole
+    CaRole --> CaPod
+    EbsRole --> EbsAddon
+    EbsAddon --> Gp3
+    CaPod -->|discovers via tags| ASG
+    ASG --> Nodes
+    BackendPods -->|scaled up, pods Pending| CaPod
+    CaPod -->|scale_up/scale_down| Nodes
+    Prom -->|PVC bound via| Gp3
+    Graf -->|data source| Prom
+    Prom -.scrapes.-> Nodes
 ```
 
 ### Quick-reference: every ARN / ID we have so far
@@ -841,34 +997,36 @@ VPC ID:                    vpc-0d0f8e9094111d711
 EKS cluster:                acme-cloud-poc-eks
 EKS cluster SG:              sg-02080e5747d7198f9
 EKS node role:                arn:aws:iam::338449997393:role/acme-cloud-poc-eks-node-role
-RDS endpoint:                  acme-cloud-poc-db.c8vqsikioi3n.us-east-1.rds.amazonaws.com
-RDS security group:              sg-0cc373dbdf0493486
-RDS secret:                        arn:aws:secretsmanager:us-east-1:338449997393:secret:acme-cloud-poc-rds-credentials-GLxxD4
-GitHub OIDC provider:                arn:aws:iam::338449997393:oidc-provider/token.actions.githubusercontent.com
-GitHub deploy role:                    arn:aws:iam::338449997393:role/acme-cloud-poc-github-deploy-role
-EKS OIDC provider (IRSA):                arn:aws:iam::338449997393:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/1CE30413C41DA517ADB1C61C126172E5
-ALB controller role:                       arn:aws:iam::338449997393:role/acme-cloud-poc-alb-controller-role
-External Secrets role:                       arn:aws:iam::338449997393:role/acme-cloud-poc-external-secrets-role
-K8s Secret (synced):                           rds-credentials (namespace: default)
-Shared live ALB (frontend + backend):            k8s-acmecloudpoc-0f83fcb8f7-780986312.us-east-1.elb.amazonaws.com
+EKS node group bounds:          min=1, desired=3, max=4
+RDS endpoint:                     acme-cloud-poc-db.c8vqsikioi3n.us-east-1.rds.amazonaws.com
+RDS security group:                 sg-0cc373dbdf0493486
+RDS secret:                           arn:aws:secretsmanager:us-east-1:338449997393:secret:acme-cloud-poc-rds-credentials-GLxxD4
+GitHub OIDC provider:                   arn:aws:iam::338449997393:oidc-provider/token.actions.githubusercontent.com
+GitHub deploy role:                       arn:aws:iam::338449997393:role/acme-cloud-poc-github-deploy-role
+EKS OIDC provider (IRSA):                   arn:aws:iam::338449997393:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/1CE30413C41DA517ADB1C61C126172E5
+ALB controller role:                          arn:aws:iam::338449997393:role/acme-cloud-poc-alb-controller-role
+External Secrets role:                          arn:aws:iam::338449997393:role/acme-cloud-poc-external-secrets-role
+Cluster Autoscaler role:                          acme-cloud-poc-cluster-autoscaler-role
+EBS CSI role:                                       acme-cloud-poc-ebs-csi-role
+Default StorageClass:                                 gp3 (provisioner: ebs.csi.aws.com)
+K8s Secret (synced):                                    rds-credentials (namespace: default)
+Monitoring namespace:                                     monitoring (Prometheus + Grafana)
+Shared live ALB (frontend + backend):                       k8s-acmecloudpoc-0f83fcb8f7-780986312.us-east-1.elb.amazonaws.com
 ECR frontend:      338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-frontend
 ECR backend:        338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-backend
 ECR notification:     338449997393.dkr.ecr.us-east-1.amazonaws.com/acme-cloud-poc-notification
 ```
 
-
-*(Phase 11 will be appended here, in this same section, once we build it.)*
-
 ---
 
 ## Infrastructure structure: `modules/` + `live/` (Terragrunt, multi-environment)
 
-- **`modules/`** — the actual resource logic (7 modules: `vpc`, `eks`, `ecr`, `rds`, `iam-oidc`, `alb-controller`, `external-secrets`). Every resource built across Phases 2-7 lives here, environment-agnostic — no hardcoded environment name, CIDR, or backend.
+- **`modules/`** — the actual resource logic (10 modules: `vpc`, `eks`, `ecr`, `rds`, `iam-oidc`, `alb-controller`, `external-secrets`, `cluster-autoscaler`, `ebs-csi`, `monitoring`). Every resource built across Phases 2-7 and 11 lives here, environment-agnostic — no hardcoded environment name, CIDR, or backend.
 - **`live/`** — one tiny `terragrunt.hcl` wrapper per module per environment (~10-40 lines each): which module to use, and that environment's specific input values. `live/terragrunt.hcl` at the root is inherited by every wrapper below it — it auto-generates the S3 backend block and AWS provider block for every module, so neither is ever hand-written again. Modules pass outputs to each other via Terragrunt `dependency` blocks instead of the old `terraform_remote_state` data source.
 
-**Three fully isolated environments are running — `poc`, `dev`, `qa`** — each with its own VPC, EKS cluster, RDS instance, and IAM roles. The one S3 bucket their state files live in (each environment gets its own state key inside that bucket — `poc/vpc/terraform.tfstate`, `dev/vpc/terraform.tfstate`, `qa/vpc/terraform.tfstate` — no collisions).
+**Three fully isolated environments exist — `poc`, `dev`, `qa`** — each with its own VPC, EKS cluster, RDS instance, and IAM roles. `poc` is the only one with Phase 11's autoscaler/storage/monitoring stack applied so far; `dev`/`qa` have Phases 2-7 running and are next in line for Phase 11. The one S3 bucket their state files live in (each environment gets its own state key inside that bucket — `poc/vpc/terraform.tfstate`, `dev/vpc/terraform.tfstate`, `qa/vpc/terraform.tfstate` — no collisions).
 
-**Adding a new environment costs ~7 small `.hcl` files with different input values — zero duplicated Terraform code.** `diff live/poc/vpc/terragrunt.hcl live/dev/vpc/terragrunt.hcl` shows a ~3 line difference (CIDR + environment name); `modules/vpc/main.tf` — the actual 100+ lines of resource logic — was never touched or copied to create `dev` or `qa`.
+**Adding a new environment costs a handful of small `.hcl` files with different input values — zero duplicated Terraform code.** `diff live/poc/vpc/terragrunt.hcl live/dev/vpc/terragrunt.hcl` shows a ~3 line difference (CIDR + environment name); `modules/vpc/main.tf` — the actual 100+ lines of resource logic — was never touched or copied to create `dev` or `qa`.
 
 ### Full picture — all three environments, connected
 
@@ -882,6 +1040,9 @@ graph TB
         MIam[iam-oidc]
         MAlb[alb-controller]
         MEso[external-secrets]
+        MCa[cluster-autoscaler]
+        MEbs[ebs-csi]
+        MMon[monitoring]
     end
 
     subgraph Root["live/terragrunt.hcl — inherited by every environment"]
@@ -889,21 +1050,22 @@ graph TB
         Provider[generates provider.tf per module]
     end
 
-    subgraph POC["live/poc/ — RUNNING — 10.0.0.0/16"]
+    subgraph POC["live/poc/ — RUNNING, Phase 11 applied — 10.0.0.0/16"]
         PVpc[VPC]
-        PEks[EKS: 3 nodes]
+        PEks[EKS: 3 nodes, autoscaled]
         PRds[(RDS)]
         PApps[backend + frontend + notification pods]
+        PMon[Cluster Autoscaler + EBS CSI + Prometheus/Grafana]
     end
 
-    subgraph DEV["live/dev/ — RUNNING — 10.1.0.0/16"]
+    subgraph DEV["live/dev/ — RUNNING, Phase 11 pending — 10.1.0.0/16"]
         DVpc[VPC]
         DEks[EKS: 2 nodes]
         DRds[(RDS)]
         DApps[backend + frontend + notification pods]
     end
 
-    subgraph QA["live/qa/ — RUNNING — 10.2.0.0/16"]
+    subgraph QA["live/qa/ — RUNNING, Phase 11 pending — 10.2.0.0/16"]
         QVpc[VPC]
         QEks[EKS: 2 nodes]
         QRds[(RDS)]
@@ -923,11 +1085,15 @@ graph TB
     MRds -.-> PRds
     MRds -.-> DRds
     MRds -.-> QRds
+    MCa -.applied only here so far.-> PMon
+    MEbs -.applied only here so far.-> PMon
+    MMon -.applied only here so far.-> PMon
 
     PEks --> PVpc
     PRds --> PVpc
     PApps --> PEks
     PApps --> PRds
+    PMon --> PEks
 
     DEks --> DVpc
     DRds --> DVpc
@@ -955,27 +1121,38 @@ platform-infrastructure/
 │   ├── rds/
 │   ├── iam-oidc/
 │   ├── alb-controller/
-│   └── external-secrets/
+│   ├── external-secrets/
+│   ├── cluster-autoscaler/
+│   ├── ebs-csi/
+│   └── monitoring/
 ├── live/                          ← per-environment wrappers, no resource logic
 │   ├── terragrunt.hcl             ← root config: generates backend + provider for everything below
-│   ├── poc/                       ← applied, running
+│   ├── poc/                       ← applied, running, Phase 11 complete
 │   │   ├── vpc/terragrunt.hcl
 │   │   ├── eks/terragrunt.hcl
 │   │   ├── ecr/terragrunt.hcl
 │   │   ├── rds/terragrunt.hcl
 │   │   ├── iam-oidc/terragrunt.hcl
 │   │   ├── alb-controller/terragrunt.hcl
-│   │   └── external-secrets/terragrunt.hcl
-│   ├── dev/                       ← running
-│   │   └── (same 7 module wrappers as poc, different inputs)
-│   └── qa/                        ← running
-│       └── (same 7 module wrappers as poc, different inputs)
+│   │   ├── external-secrets/terragrunt.hcl
+│   │   ├── cluster-autoscaler/terragrunt.hcl
+│   │   ├── ebs-csi/terragrunt.hcl
+│   │   └── monitoring/terragrunt.hcl
+│   ├── dev/                       ← running, Phase 11 pending
+│   │   └── (same 7 Phase 2-7 module wrappers as poc, different inputs)
+│   └── qa/                        ← running, Phase 11 pending
+│       └── (same 7 Phase 2-7 module wrappers as poc, different inputs)
 ├── helm/
 │   └── (base charts / shared values)
 ├── kubernetes/
 │   └── (cluster-level configs, namespaces, RBAC)
 ├── .github/workflows/
 │   └── reusable-deploy.yml
+├── up-poc.sh / down-poc.sh        ← bring poc up/down, full dependency order + auto lock recovery
+├── up-dev.sh / down-dev.sh
+├── up-qa.sh / down-qa.sh
+├── test1-monitoring.sh            ← verify Prometheus/Grafana are actually working
+├── test2-cluster-autoscaler.sh    ← verify Cluster Autoscaler scales nodes up and down
 ├── POC.md
 ├── RUNBOOK.md
 ├── Must-Manual-setup.md

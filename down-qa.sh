@@ -28,7 +28,7 @@ run_terragrunt() {
 
   if [[ $exit_code -ne 0 ]] && grep -q "Error acquiring the state lock" "$tmp_out"; then
     local lock_id
-    lock_id=$(grep -A1 -E '^\s*ID:' "$tmp_out" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    lock_id=$(grep -A1 -E 'ID:' "$tmp_out" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
 
     if [[ -z "$lock_id" ]]; then
       echo "Lock error detected, but couldn't parse a Lock ID from the output. Manual intervention needed."

@@ -26,4 +26,5 @@ inputs = {
   eks_cluster_name                  = dependency.eks.outputs.cluster_name
   eks_cluster_endpoint              = dependency.eks.outputs.cluster_endpoint
   eks_cluster_certificate_authority = dependency.eks.outputs.cluster_certificate_authority
+  grafana_admin_password            = get_env("TF_VAR_grafana_admin_password", "")
 }
