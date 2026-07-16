@@ -4,6 +4,8 @@ Central platform repo for the **Acme Cloud** microservices project — Terraform
 
 ## Documentation — start here
 
+📸 **Demo screenshots**: [check the demos in this link](https://drive.google.com/drive/folders/1YyyVQRwlvohU9LjH2q3Wt0eTzHJmoF_7?usp=sharing)
+
 We have 4 docs now, each answering a different question. Read in this order the first time:
 
 | Doc | Answers | Read when |
